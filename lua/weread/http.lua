@@ -261,7 +261,12 @@ local function attempt(opts, callback)
     argv[#argv + 1] = "@-"
   end
 
-  local spawn_opts = { text = true, timeout = (opts.timeout or config.timeout + 5) * 1000 }
+  -- The spawn timeout must stay strictly larger than curl's own `--max-time`,
+  -- otherwise vim.system kills curl first and its useful timeout diagnostics
+  -- are lost. (Parentheses matter here: `a or b + 5` parses as `a or (b + 5)`.)
+  -- (进程超时必须比 curl 自身的 --max-time 宽松，否则会被 vim.system 先杀掉，
+  --  丢掉 curl 的超时诊断；注意括号：`a or b + 5` 会解析成 `a or (b + 5)`)
+  local spawn_opts = { text = true, timeout = ((opts.timeout or config.timeout) + 5) * 1000 }
   if stdin then
     spawn_opts.stdin = stdin
   end
@@ -287,7 +292,9 @@ local function attempt(opts, callback)
 
     if not opts.out then
       res.body = read_file(body_path)
-      res.error = res.error or (not res.body and "empty response body" or nil)
+      if not res.body and not res.error then
+        res.error = "empty response body"
+      end
     end
 
     if not opts.out then
@@ -295,7 +302,16 @@ local function attempt(opts, callback)
       os.remove(body_path .. ".headers")
     end
 
-    callback(res)
+    -- `vim.system` callbacks run in a fast event context, where vimscript
+    -- functions such as `vim.fn.mkdir` raise E5560. Every caller of this
+    -- module expects a plain main-loop callback, so hop back before handing
+    -- the response over.
+    -- (vim.system 的回调运行在 fast event context，其中 vim.fn.mkdir 之类的
+    --  vimscript 函数会报 E5560；本模块的调用方都假定自己在主循环里，
+    --  因此先切回主循环再交付响应)
+    vim.schedule(function()
+      callback(res)
+    end)
   end)
 
   active[job] = true
