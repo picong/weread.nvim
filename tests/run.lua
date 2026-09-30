@@ -39,8 +39,59 @@ if #specs == 0 then
 end
 
 io.stdout:write(string.format("running %d spec file(s) from %s\n", #specs, root))
+
+-- Specs run in one nvim instance, so a spec that stubs modules or vim
+-- functions would leak into the next one. Snapshot and restore around each
+-- file: import order stops mattering, and a spec can never poison another.
+-- (所有 spec 共用一个 nvim 实例，打桩过模块或 vim 函数的 spec 会污染后面的 spec。
+--  因此在每个 spec 文件前后做快照与还原：导入顺序不再重要，spec 之间不会互相下毒)
+local VIM_HOOKS = {
+  { "notify", false },
+  { "defer_fn", false },
+  { "ui", "input" },
+}
+
+local function snapshot()
+  local loaded = {}
+  for key, value in pairs(package.loaded) do
+    loaded[key] = value
+  end
+  local hooks = {}
+  for _, hook in ipairs(VIM_HOOKS) do
+    local target = hook[2] and vim[hook[1]][hook[2]] or vim[hook[1]]
+    hooks[#hooks + 1] = target
+  end
+  return { loaded = loaded, hooks = hooks, timer_stop = vim.fn.timer_stop }
+end
+
+local function restore(state)
+  for key in pairs(package.loaded) do
+    if state.loaded[key] == nil then
+      package.loaded[key] = nil
+    end
+  end
+  for key, value in pairs(state.loaded) do
+    package.loaded[key] = value
+  end
+  for index, hook in ipairs(VIM_HOOKS) do
+    if hook[2] then
+      vim[hook[1]][hook[2]] = state.hooks[index]
+    else
+      vim[hook[1]] = state.hooks[index]
+    end
+  end
+  vim.fn.timer_stop = state.timer_stop
+end
+
 for _, name in ipairs(specs) do
-  dofile(root .. "/tests/spec/" .. name)
+  local state = snapshot()
+  local ok, err = pcall(dofile, root .. "/tests/spec/" .. name)
+  restore(state)
+  if not ok then
+    io.stdout:write("  !! " .. name .. " raised: " .. tostring(err) .. "\n")
+    framework.failed = framework.failed + 1
+    table.insert(framework.failures, { name = name, message = tostring(err) })
+  end
 end
 
 os.exit(framework.finish() and 0 or 1)

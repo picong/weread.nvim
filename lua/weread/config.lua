@@ -41,6 +41,11 @@ M.defaults = {
   ---@type string|nil
   proxy = nil,
 
+  ---Service root. Only changed by tests, which point it at a local mock server.
+  ---(服务根地址；仅测试会改成本地 mock 服务器)
+  ---@type string
+  base_url = "https://weread.qq.com",
+
   ---Register the default buffer-local keymaps in chapter buffers.
   ---(在章节 buffer 注册默认快捷键)
   ---@type boolean

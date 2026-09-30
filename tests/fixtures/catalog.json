@@ -1,0 +1,40 @@
+{
+ "data": [
+  {
+   "bookId": "43208843",
+   "format": "epub",
+   "synckey": 11,
+   "book": {
+    "title": "持续交付2.0",
+    "author": "乔梁"
+   },
+   "updated": [
+    {
+     "chapterUid": 1,
+     "chapterIdx": 1,
+     "title": "封面",
+     "wordCount": 0,
+     "level": 1,
+     "paid": 0
+    },
+    {
+     "chapterUid": 2,
+     "chapterIdx": 2,
+     "title": "第 3 章 宇宙闪烁",
+     "wordCount": 151,
+     "level": 1,
+     "paid": 0,
+     "tar": "{{BASE}}/wrco/tar_43208843_36"
+    },
+    {
+     "chapterUid": 119,
+     "chapterIdx": 3,
+     "title": "第 4 章 三体、牛顿、秦始皇",
+     "wordCount": 200,
+     "level": 1,
+     "paid": 1
+    }
+   ]
+  }
+ ]
+}
