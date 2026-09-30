@@ -23,7 +23,17 @@ start and end on a text run in practice, and the UI marks whole lines anyway.
  且 UI 只做整行标记，因此足够)
 ]]
 
+local config = require("weread.config")
+
 local M = {}
+
+---Bump whenever the rendered output changes shape (paragraph handling, indents,
+---image syntax...). Chapters cached by an older renderer are re-rendered from
+---the cached source XHTML locally, without touching the network, so a typography
+---tweak reaches books that are already downloaded.
+---(渲染结果形态变化时递增（段落处理、缩进、图片语法…）。旧渲染器缓存的章节会用
+--- 已缓存的源 XHTML 在本地重排，不联网，因此排版调整能作用到已下载的书)
+M.VERSION = 2
 
 local BLOCK_TAGS = {
   p = true,
@@ -134,16 +144,44 @@ end
 
 ---Line buffer that tracks byte columns so segments can record their position.
 ---(行缓冲：跟踪字节列号，以便段落记录自己的位置)
+---
+---Typesetting note: a Chinese book separates paragraphs by indentation, while
+---markdown normally uses a blank line. With one blank line per paragraph, half
+---of every screen is empty. Compact mode therefore emits a plain line break and
+---queues a first-line indent instead.
+---(排版说明：中文书靠首行缩进区分段落，而 markdown 惯例是空行。每段一个空行意味
+--- 着每屏一半是空白，因此紧凑模式改为换行 + 首行缩进)
 local Buffer = {}
 Buffer.__index = Buffer
 
-function Buffer.new()
-  return setmetatable({ lines = {}, current = {}, col = 0, map = {} }, Buffer)
+---@param opts table|nil { compact, indent }
+function Buffer.new(opts)
+  opts = opts or {}
+  return setmetatable({
+    lines = {},
+    current = {},
+    col = 0,
+    map = {},
+    compact = opts.compact ~= false,
+    indent = opts.indent or "",
+    pending_indent = false,
+  }, Buffer)
 end
 
 function Buffer:append(text, src_from, src_to)
   if text == "" then
     return
+  end
+  if self.pending_indent then
+    -- TXT books already carry a full-width indent; adding another would double
+    -- it. Same for text that starts with an ASCII space.
+    -- (TXT 型书籍自带全角缩进，再加一次就重复了；以半角空格开头的同理)
+    local head = text:sub(1, 3)
+    if head == "　" or text:sub(1, 1) == " " then
+      self.pending_indent = false
+    else
+      self:flush_indent()
+    end
   end
   self.map[#self.map + 1] = {
     src_from = src_from,
@@ -156,18 +194,47 @@ function Buffer:append(text, src_from, src_to)
   self.col = self.col + #text
 end
 
----Append syntax that has no counterpart in the source (`# `, `- `, `*`, ...).
+---Append inline syntax with no counterpart in the source (`*`, `**`, `` ` ``).
 ---Markers are deliberately kept out of the offset map: a zero-width segment
----could never contain a rune and would only bloat the map.
----(追加在源码中没有对应物的语法标记（`# `、`- `、`*` 等）。标记刻意不写入 offset
---- map：零宽段落永远不可能包含某个 rune，只会让 map 膨胀)
+---could never contain a rune and would only bloat the map. A queued indent
+---survives, so a paragraph that opens with emphasis still gets indented.
+---(追加源码中没有对应物的行内标记（`*`、`**`、反引号）。标记刻意不写入 offset
+--- map：零宽段落永远不可能包含某个 rune，只会让 map 膨胀。排队的缩进会保留，
+--- 因此以强调开头的段落仍然能正确缩进)
 ---@param text string
 function Buffer:marker(text)
+  -- Write a queued indent first: `*注意*...` must become `　　*注意*...`, not
+  -- `*　　注意*...`.
+  -- (先把排队的缩进落下去：`*注意*…` 应当是 `　　*注意*…`，不能变成 `*　　注意*…`)
+  self:flush_indent()
   if text == "" then
     return
   end
   self.current[#self.current + 1] = text
   self.col = self.col + #text
+end
+
+---Write the queued paragraph indent, if any.
+---(把排队的段落缩进写下去)
+function Buffer:flush_indent()
+  if not self.pending_indent then
+    return
+  end
+  self.pending_indent = false
+  if self.indent ~= "" then
+    self.current[#self.current + 1] = self.indent
+    self.col = self.col + #self.indent
+  end
+end
+
+---Same, for markers that own a whole line (`# `, `- `, `> `, figures). These are
+---structural, so a queued paragraph indent must be dropped.
+---(同上，用于独占一行的标记（`# `、`- `、`> `、插图）。它们是结构性的，因此必须
+--- 丢弃排队中的段落缩进)
+---@param text string
+function Buffer:block_marker(text)
+  self.pending_indent = false
+  self:marker(text)
 end
 
 function Buffer:is_empty()
@@ -178,7 +245,10 @@ end
 ---(去掉行尾空格，markdown 里只会变成噪音)
 function Buffer:flush()
   local line = table.concat(self.current)
-  line = line:gsub("[ \t]+$", "")
+  -- Trailing whitespace is noise in markdown, full-width spaces included: a
+  -- line holding nothing but a queued indent must disappear.
+  -- (行尾空白在 markdown 里是噪音，全角空格同理：只有缩进的空行必须消失)
+  line = line:gsub("[ \t]+$", ""):gsub("　+$", "")
   self.lines[#self.lines + 1] = line
   self.current = {}
   self.col = 0
@@ -190,13 +260,25 @@ function Buffer:newline()
   end
 end
 
----End the current paragraph: flush and guarantee one blank line.
----(结束一个段落：落行并保证一个空行)
-function Buffer:paragraph()
+---Force a blank line: used around headings, figures and rules, where the extra
+---breathing room is worth the vertical space.
+---(强制空行：用于标题/插图/分隔线，这些地方留白值得)
+function Buffer:gap()
   self:newline()
   local lines = self.lines
   if #lines > 0 and lines[#lines] ~= "" then
     lines[#lines + 1] = ""
+  end
+end
+
+---Separate the next paragraph from the current one.
+---(分隔下一段：紧凑模式只换行并排队缩进，经典模式插入空行)
+function Buffer:separate()
+  self:newline()
+  if self.compact then
+    self.pending_indent = self.indent ~= ""
+  else
+    self:gap()
   end
 end
 
@@ -235,7 +317,14 @@ function M.convert(xhtml, opts)
     source = source:sub(4)
   end
 
-  local buffer = Buffer.new()
+  local paragraph = opts.paragraph
+  if paragraph == nil then
+    paragraph = config.get().paragraph
+  end
+  local buffer = Buffer.new({
+    compact = paragraph.compact,
+    indent = paragraph.indent,
+  })
   local images = {}
   local rune = 0
   local pos = 1
@@ -250,10 +339,15 @@ function M.convert(xhtml, opts)
     end
 
     if close then
-      if HEADINGS[tag_name] or BLOCK_TAGS[tag_name] then
-        if tag_name ~= "br" then
-          buffer:paragraph()
-        end
+      -- Closing block tags do nothing: the *next* block's separator already
+      -- ends the line, so a paragraph followed by another one stays tight.
+      -- Headings and figures add their own gap.
+      -- (闭合标签不做处理：下一块开始时的分隔已经结束本行，于是相邻段落自然紧凑；
+      --  标题与插图会自己补空行)
+      if HEADINGS[tag_name] then
+        buffer:gap()
+      elseif tag_name == "blockquote" then
+        buffer:separate()
       elseif tag_name == "em" or tag_name == "i" then
         buffer:marker("*")
       elseif tag_name == "strong" or tag_name == "b" then
@@ -265,24 +359,24 @@ function M.convert(xhtml, opts)
     end
 
     if HEADINGS[tag_name] then
-      buffer:paragraph()
+      buffer:gap()
       local level = math.min(6, math.max(1, HEADINGS[tag_name] + heading_offset))
-      buffer:marker(string.rep("#", level) .. " ")
+      buffer:block_marker(string.rep("#", level) .. " ")
     elseif tag_name == "li" then
-      buffer:newline()
-      buffer:marker("- ")
+      buffer:separate()
+      buffer:block_marker("- ")
     elseif tag_name == "blockquote" then
-      buffer:newline()
-      buffer:marker("> ")
+      buffer:separate()
+      buffer:block_marker("> ")
     elseif tag_name == "br" then
       -- A hard break inside a paragraph reads better as a real line break in
       -- the editor, which is what plain markdown soft wrapping gives us.
       -- (段落内的换行在编辑器里就是真换行，也就是 markdown 的软换行)
       buffer:newline()
     elseif tag_name == "hr" then
-      buffer:paragraph()
-      buffer:marker("---")
-      buffer:paragraph()
+      buffer:gap()
+      buffer:block_marker("---")
+      buffer:gap()
     elseif tag_name == "em" or tag_name == "i" then
       buffer:marker("*")
     elseif tag_name == "strong" or tag_name == "b" then
@@ -297,15 +391,15 @@ function M.convert(xhtml, opts)
         resolved = resolve_image(src) or src
       end
       images[#images + 1] = { src = src, resolved = resolved, alt = alt }
-      buffer:paragraph()
-      buffer:marker(string.format("![%s](%s)", alt, resolved))
-      buffer:paragraph()
+      buffer:gap()
+      buffer:block_marker(string.format("![%s](%s)", alt, resolved))
+      buffer:gap()
     elseif tag_name == "td" or tag_name == "th" then
       if not buffer:is_empty() then
         buffer:marker(" | ")
       end
     elseif BLOCK_TAGS[tag_name] then
-      buffer:paragraph()
+      buffer:separate()
     end
   end
 

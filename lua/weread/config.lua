@@ -11,10 +11,35 @@ M.defaults = {
   ---@type string|nil
   data_dir = nil,
 
-  ---Rendered chapter width in characters. 0 keeps the window width.
-  ---(正文渲染宽度，0 表示跟随窗口)
+  ---Width guide drawn as a colorcolumn. 0 disables it; it is off by default
+  ---because a solid vertical line through Chinese text reads badly.
+  ---(用 colorcolumn 画的宽度参考线。0 表示不画；默认关闭，因为一条竖线穿过中文
+  --- 正文观感很差)
   ---@type integer
-  text_width = 78,
+  text_width = 0,
+
+  ---Typesetting of the rendered body.
+  ---(正文排版)
+  ---@type table
+  paragraph = {
+    ---Drop the blank line between paragraphs. A Chinese book separates
+    ---paragraphs by indentation, not by empty lines, and the blank lines
+    ---otherwise eat half of every screen.
+    ---(去掉段间空行。中文书靠首行缩进区分段落而不是空行，否则每屏一半是空白)
+    compact = true,
+    ---Prefix for the first line of a paragraph. Ignored when the source
+    ---already carries its own indent (TXT books ship with full-width spaces).
+    ---(段落首行缩进。若原文自带缩进则不再追加——TXT 型书籍本身带全角空格)
+    indent = "　　",
+    ---Blank lines kept around headings, figures and rules.
+    ---(标题、插图、分隔线周围保留的空行)
+    block_gap = true,
+  },
+
+  ---Highlight the paragraph under the cursor.
+  ---(是否高亮光标所在段落)
+  ---@type boolean
+  cursorline = false,
 
   ---Upload the local position/reading time to WeRead every N seconds. 0 disables it.
   ---(每 N 秒把本地进度与阅读时长回传微信读书，0 表示关闭)
@@ -31,7 +56,12 @@ M.defaults = {
   ---@type table
   image = {
     max_width = 60,
-    max_height = 30,
+    ---Kept modest on purpose: a tall figure pushes the text off screen.
+    ---(刻意克制：太高的插图会把正文挤下去)
+    max_height = 20,
+    ---Icon replacing the markdown image syntax while reading.
+    ---(阅读时替换 markdown 图片语法的图标)
+    icon = "⧉",
   },
 
   ---HTTP proxy mode: nil inherits the environment, "direct" bypasses every proxy.
@@ -45,6 +75,11 @@ M.defaults = {
   ---(服务根地址；仅测试会改成本地 mock 服务器)
   ---@type string
   base_url = "https://weread.qq.com",
+
+  ---Official Agent API origin or full endpoint url.
+  ---(官方 Agent API 的 origin 或完整端点地址)
+  ---@type string
+  gateway_url = "https://i.weread.qq.com",
 
   ---Register the default buffer-local keymaps in chapter buffers.
   ---(在章节 buffer 注册默认快捷键)
@@ -91,7 +126,10 @@ end
 function M.ensure_dirs()
   local root = M.data_dir()
   for _, dir in ipairs({ root, root .. "/books", root .. "/tmp" }) do
-    vim.fn.mkdir(dir, "p")
+    local ok, err = pcall(vim.fn.mkdir, dir, "p")
+    if not ok then
+      error(string.format("weread: 无法创建数据目录 %s（可在 setup 里改 data_dir）：%s", dir, tostring(err)))
+    end
   end
   return root
 end

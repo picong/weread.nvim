@@ -174,6 +174,44 @@ function M.hover_at_cursor()
   M.hover()
 end
 
+---Replace the markdown image syntax with a short icon while reading.
+---(阅读时把 markdown 图片语法替换成一个短图标)
+---
+---`![图 1-6](/home/you/.local/share/nvim/weread/books/43208843/assets/epub_x.png)`
+---turns into `⧉ 图 1-6`. The long cache path is the single ugliest thing on a
+---reading screen, and it is pure noise once the figure is rendered or reachable
+---with <leader>wo.
+---(长缓存路径是阅读界面里最丑的东西，而且一旦插图渲染出来、或能用 <leader>wo
+--- 查看，它就是纯噪音)
+---@param buf integer
+function M.conceal_links(buf)
+  if not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+  local namespace = vim.api.nvim_create_namespace("weread.image.conceal")
+  vim.api.nvim_buf_clear_namespace(buf, namespace, 0, -1)
+
+  local icon = (require("weread.config").get().image or {}).icon or "⧉"
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  for index, line in ipairs(lines) do
+    local start_col, end_col, alt = line:find("!%[([^%]]*)%]%(([^%s%)]+)%)")
+    if start_col then
+      alt = alt or ""
+      local alt_start = start_col + 1 -- 0-based column of the alt text(alt 的 0 基列号)
+      -- conceal `![` into the icon
+      pcall(vim.api.nvim_buf_set_extmark, buf, namespace, index - 1, start_col - 1, {
+        end_col = start_col + 1,
+        conceal = icon .. " ",
+      })
+      -- and `](path)` into nothing
+      pcall(vim.api.nvim_buf_set_extmark, buf, namespace, index - 1, alt_start + #alt, {
+        end_col = end_col,
+        conceal = "",
+      })
+    end
+  end
+end
+
 ---Mark image lines when inline rendering is unavailable, so a reader is not
 ---left wondering why a line holds nothing but a path.
 ---(无法内联渲染时给图片行加提示，免得读者对着一行路径发愣)
@@ -207,6 +245,7 @@ function M.attach(buf)
   -- `enabled = function() return not vim.b.weread_book end`
   -- (给用户侧的其它 markdown 渲染器留一个开关)
   vim.b[buf].weread_book = true
+  M.conceal_links(buf)
   M.mark_lines(buf)
 end
 

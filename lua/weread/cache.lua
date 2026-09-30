@@ -104,7 +104,12 @@ end
 ---@return boolean ok
 ---@return string|nil err
 function M.write(path, data)
-  vim.fn.mkdir(vim.fs.dirname(path), "p")
+  -- See qr.encode: vim.fn.mkdir raises rather than reporting failure.
+  -- (同 qr.encode：vim.fn.mkdir 失败时会抛异常)
+  local made, mkdir_err = pcall(vim.fn.mkdir, vim.fs.dirname(path), "p")
+  if not made then
+    return false, "could not create " .. vim.fs.dirname(path) .. ": " .. tostring(mkdir_err)
+  end
   local tmp = path .. ".part"
   local file, open_err = io.open(tmp, "wb")
   if not file then
@@ -125,7 +130,10 @@ end
 ---@return boolean ok
 ---@return string|nil err
 function M.append(path, data)
-  vim.fn.mkdir(vim.fs.dirname(path), "p")
+  local made, mkdir_err = pcall(vim.fn.mkdir, vim.fs.dirname(path), "p")
+  if not made then
+    return false, "could not create " .. vim.fs.dirname(path) .. ": " .. tostring(mkdir_err)
+  end
   local file = io.open(path, "ab")
   if not file then
     return false, "could not append to " .. path

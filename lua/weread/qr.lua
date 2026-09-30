@@ -65,7 +65,14 @@ function M.encode(text, path, opts)
     return false, "qrencode not found"
   end
   opts = opts or {}
-  vim.fn.mkdir(vim.fs.dirname(path), "p")
+  -- vim.fn.mkdir raises (E739) instead of returning a status, so a bad target
+  -- would escape as a hard error rather than this function's error contract.
+  -- (vim.fn.mkdir 失败时抛 E739 而不是返回状态，否则写不进去时会以硬错误逃逸，
+  --  破坏本函数的错误契约)
+  local made, mkdir_err = pcall(vim.fn.mkdir, vim.fs.dirname(path), "p")
+  if not made then
+    return false, "无法创建目录：" .. tostring(mkdir_err)
+  end
   local result = vim.system({
     "qrencode",
     "--output",
@@ -147,16 +154,24 @@ function M.show(text, opts)
   local png = opts.png or png_path()
 
   if M.image_supported() and M.encode(text, png, { scale = opts.scale or 6 }) then
-    local size = png_size(png)
-    local width = opts.width or 44
+    -- png_size returns two values; taking only the first silently produced a
+    -- number where a table was expected — i.e. this whole branch crashed, and
+    -- only terminals with image support ever reached it.
+    -- (png_size 返回两个值；只接第一个会让 size 变成数字而不是表 —— 整条图片分支
+    --  都会崩，而只有支持图片的终端才会走到这里)
+    local pixel_width, pixel_height = png_size(png)
+    local screen_width = math.max(20, vim.o.columns - 6)
+    local screen_height = math.max(5, vim.o.lines - 6)
+    local width = math.max(10, math.min(opts.width or 44, screen_width))
     local height = opts.height or width
-    if size and size.width > 0 and size.height > 0 then
-      -- Terminal cells are roughly twice as tall as wide, so keep the float
-      -- square by halving the aspect ratio.
-      -- (终端单元格大致高宽比为 2:1，因此把宽高比折半以保持浮窗接近正方形)
-      local ratio = size.height / size.width
-      height = math.max(6, math.floor(width * ratio * 0.5))
+    if pixel_width and pixel_height and pixel_width > 0 then
+      -- Terminal cells are roughly twice as tall as wide, so halve the aspect
+      -- ratio to keep the QR code square on screen.
+      -- (终端单元格大致高宽比 2:1，因此把宽高比折半，让二维码在屏幕上保持正方形)
+      local ratio = pixel_height / pixel_width
+      height = math.floor(width * ratio * 0.5) + 1
     end
+    height = math.max(3, math.min(height, screen_height))
 
     local win = float.open({
       title = title,

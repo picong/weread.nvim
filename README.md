@@ -113,6 +113,7 @@ require("render-markdown").setup({
 | `<leader>wa` | 本章划线与想法汇总 |
 | `<leader>ws` | 立即回传进度 |
 | `<leader>wr` | 重新抓取本章 |
+| `j` / `k` | 上下移动（一行 = 一个段落，因为段间不再有空行） |
 
 这里刻意占用了 `<leader>w` 前缀（LazyVim 的窗口组），但只在章节 buffer 内生效。
 
@@ -120,10 +121,13 @@ require("render-markdown").setup({
 
 ```lua
 require("weread").setup({
-  text_width = 78,          -- 正文宽度参考线，0 表示不设
+  -- 排版：紧凑（段间不留空行）+ 首行缩进两格，像中文书那样
+  paragraph = { compact = true, indent = "　　", block_gap = true },
+  text_width = 0,           -- >0 会在正文里画一条 colorcolumn 竖线（默认关）
+  cursorline = false,       -- 是否高亮整个光标行
   sync_interval = 60,       -- 进度回传间隔（秒），0 关闭回传
   sync_on_leave = true,     -- 离开章节时结算并回传
-  image = { max_width = 60, max_height = 30 },
+  image = { max_width = 60, max_height = 20, icon = "⧉" },
   keymaps = true,           -- 章节 buffer 内注册默认快捷键
   proxy = nil,              -- nil 沿用环境变量，"direct" 强制直连
   base_url = "https://weread.qq.com",
@@ -132,6 +136,26 @@ require("weread").setup({
   debug = false,            -- 写日志到 data_dir/weread.log
 })
 ```
+
+### 排版说明
+
+正文按中文书的样子渲染，而不是按 markdown 的习惯：
+
+- **段间不留空行**，靠首行缩进两格区分段落。原本每段一个空行时，一屏有一半是空白（实测 10 段占 19 行，现在 10 行）。
+- 标题、插图、分隔线周围保留空行；列表项独占一行且不缩进。
+- 原文自带全角缩进的 TXT 型书籍不会重复缩进。
+- **插图行只显示一个图标与图注**：`![图 1-6](/home/…/assets/epub_x.png)` 显示为 `⧉ 图 1-6`，长缓存路径被 conceal 掉，`<leader>wo` 仍可放大查看。
+- 默认不画 `colorcolumn` 竖线、不高亮整行。
+
+### 续读行为
+
+打开一本书时（`:WeRead <书名>` / `:WeReadOpen <bookId>` / `:WeReadResume`）：
+
+1. 有本地阅读记录 → **直接跳到上次那一章那一行**，并提示「续读《书名》· 章节名」；
+2. 本地没记录但服务端进度已越过开篇章节 → 按服务端进度续读；
+3. 两边都没有 → 打开目录让你选。
+
+阅读位置在离开章节、切换窗口、退出、以及阅读中每 5 秒各记录一次（切章时以新章节为准，不会被上一章覆盖）。想看目录随时 `<leader>wt` 或 `:WeReadToc`。
 
 ## 数据与凭据
 

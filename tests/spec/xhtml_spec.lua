@@ -114,13 +114,13 @@ describe("xhtml.convert", function()
     local offset = rune_offset_of(source, "正文甲")
     local start = xhtml.resolve(result, offset, offset + 3)
     truthy(start, "the offset still resolves after a skipped block")
-    eq(vim.split(result.text, "\n", { plain = true })[start.line + 1], "正文甲")
+    eq(vim.split(result.text, "\n", { plain = true })[start.line + 1], "　　正文甲")
   end)
 
   it("keeps counting runes across comments", function()
     local source = '<p>前<!-- 注释 -->后</p>'
     local result = xhtml.convert(source)
-    eq(result.text, "前后")
+    eq(result.text, "　　前后", "the paragraph indent is applied")
     local offset = rune_offset_of(source, "后")
     local start = xhtml.resolve(result, offset, offset + 1)
     truthy(start)
@@ -174,7 +174,7 @@ describe("xhtml.resolve", function()
     --  字符级偏移)
     local resolved = resolve_text("把车停在")
     local lines = vim.split(result.text, "\n", { plain = true })
-    eq(lines[resolved.start.line + 1], "汪淼把车停在楼下，抬头看天。")
+    eq(lines[resolved.start.line + 1], "　　汪淼把车停在楼下，抬头看天。")
     eq(resolved.finish.line, resolved.start.line)
   end)
 
@@ -230,5 +230,80 @@ describe("xhtml.convert edge cases", function()
   it("never emits two consecutive blank lines", function()
     local result = xhtml.convert("<div><p>a</p></div><div><p>b</p></div>")
     falsy(result.text:find("\n\n\n", 1, true), "got: " .. result.text:gsub("\n", "\\n"))
+  end)
+end)
+
+describe("xhtml.convert typesetting", function()
+  ---@param count integer
+  ---@return string
+  local function paragraphs(count)
+    local parts = {}
+    for index = 1, count do
+      parts[#parts + 1] = string.format("<p>第 %d 段的正文内容。</p>", index)
+    end
+    return table.concat(parts)
+  end
+
+  ---@param text string
+  ---@return string[] lines
+  local function lines_of(text)
+    return vim.split(text, "\n", { plain = true })
+  end
+
+  it("spends one line per paragraph instead of two", function()
+    -- The whole point: blank lines between paragraphs waste half of every
+    -- screen, which is what made the reader hard to read.
+    -- (重点在这里：段间空行浪费了每屏一半空间，这是阅读吃力的根源)
+    local result = xhtml.convert(paragraphs(10), { paragraph = { compact = true, indent = "　　" } })
+    local lines = lines_of(result.text)
+    eq(#lines, 10, "ten paragraphs, ten lines")
+    for _, line in ipairs(lines) do
+      truthy(vim.startswith(line, "　　"), "every paragraph is indented: " .. line)
+    end
+  end)
+
+  it("still separates paragraphs when compact mode is off", function()
+    local result = xhtml.convert(paragraphs(3), { paragraph = { compact = false } })
+    local lines = lines_of(result.text)
+    eq(#lines, 5, "three paragraphs plus two blank lines")
+    eq(lines[2], "")
+    eq(lines[1], "第 1 段的正文内容。", "no indent in the classic layout")
+  end)
+
+  it("does not double an indent the source already carries", function()
+    -- TXT books ship with a full-width space of their own.
+    -- (TXT 型书籍自带全角缩进)
+    local result = xhtml.convert("<p>　　许阳睁开眼睛。</p>", { paragraph = { compact = true, indent = "　　" } })
+    eq(result.text, "　　许阳睁开眼睛。")
+  end)
+
+  it("keeps the indent for a paragraph that starts with emphasis", function()
+    local result = xhtml.convert("<p><em>注意</em>后面的正文。</p>", { paragraph = { compact = true, indent = "　　" } })
+    eq(result.text, "　　*注意*后面的正文。")
+  end)
+
+  it("keeps blank lines around headings and figures", function()
+    local result = xhtml.convert("<h1>标题</h1><p>甲</p><img src=\"/a.png\"/><p>乙</p>", {
+      paragraph = { compact = true, indent = "　　" },
+    })
+    eq(lines_of(result.text), {
+      "# 标题",
+      "",
+      "　　甲",
+      "",
+      "![](/a.png)",
+      "",
+      "　　乙",
+    })
+  end)
+
+  it("lists items on their own line without indentation", function()
+    local result = xhtml.convert("<ul><li>甲</li><li>乙</li></ul>", { paragraph = { compact = true, indent = "　　" } })
+    eq(lines_of(result.text), { "- 甲", "- 乙" })
+  end)
+
+  it("uses the plugin defaults when no options are passed", function()
+    local result = xhtml.convert(paragraphs(2))
+    eq(lines_of(result.text), { "　　第 1 段的正文内容。", "　　第 2 段的正文内容。" })
   end)
 end)

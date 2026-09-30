@@ -134,6 +134,10 @@ describe("reader against a mock server", function()
     -- (让它成为阅读器的窗口选项)
     eq(vim.wo.wrap, true)
     eq(vim.wo.number, false)
+    eq(vim.wo.colorcolumn, "", "no vertical guide line through the text by default")
+    eq(vim.wo.cursorline, false, "a highlighted line across Chinese text is heavy")
+    eq(vim.wo.conceallevel, 2, "needed to hide markdown syntax")
+    eq(vim.bo[buf].modifiable, false)
     truthy(vim.wo.winbar:find("第 3 章", 1, true), "winbar shows the chapter")
 
     -- cache artefacts
@@ -219,6 +223,87 @@ describe("reader against a mock server", function()
       return reader.buffer_info() and reader.buffer_info().chapter_index == 2
     end, 50)
     eq(reader.buffer_info().chapter_index, 2)
+  end)
+
+  it("re-renders a chapter cached by an older renderer without the network", function()
+    local chapter = reader.state.catalog.chapters[2]
+    local map_path = cache.chapter_file(BOOK_ID, chapter, "map.json")
+    local md_path = cache.chapter_file(BOOK_ID, chapter, "md")
+
+    -- simulate a cache produced by the previous typography
+    -- (模拟由上一版排版产出的缓存)
+    local meta = cache.read_json(map_path)
+    meta.renderer = 1
+    cache.write_json(map_path, meta)
+    cache.write(md_path, "　　旧的排版")
+
+    live.reset()
+    reader.open_index(2, {})
+    vim.wait(5000, function()
+      return (cache.read(md_path) or ""):find("汪淼把车停在楼下", 1, true) ~= nil
+    end, 50)
+
+    eq(#live.requests, 0, "the re-render used the cached source XHTML")
+    eq(cache.read_json(map_path).renderer, require("weread.xhtml").VERSION)
+    local fresh = cache.read(md_path)
+    truthy(fresh:find("　　汪淼把车停在楼下", 1, true), "re-rendered with the indented layout")
+    falsy(fresh:find("旧的排版", 1, true), "the stale body is gone")
+  end)
+
+  it("resumes the recorded chapter instead of the table of contents", function()
+    local ui = require("weread.ui")
+    local real_select = ui.select
+    local picked = false
+    ui.select = function()
+      picked = true
+    end
+
+    -- chapter index 3 of the fixture catalog
+    -- (夹具目录里的第 3 项)
+    cache.write_position(BOOK_ID, {
+      chapter_key = "0003",
+      chapter_index = 3,
+      chapter_uid = "119",
+      line = 1,
+      updated_at = os.time(),
+    })
+
+    local ok, err = pcall(function()
+      reader.open_book(BOOK_ID, {})
+      vim.wait(20000, function()
+        local info = reader.buffer_info()
+        return info ~= nil and info.chapter_index == 3
+      end, 100)
+    end)
+    ui.select = real_select
+    truthy(ok, tostring(err))
+
+    falsy(picked, "the index must not be shown when there is a position to resume")
+    eq(reader.buffer_info().chapter_index, 3, "landed on the recorded chapter")
+    eq(reader.saved_position(BOOK_ID), 3)
+  end)
+
+  it("shows the table of contents for a book with no history at all", function()
+    local ui = require("weread.ui")
+    local real_select = ui.select
+    local picked = false
+    ui.select = function()
+      picked = true
+    end
+
+    vim.fn.delete(config.path("positions.json"))
+    -- No local record, and the service reports the opening chapter: that is what
+    -- a book you have never opened looks like. It must not be treated as
+    -- "resume here".
+    -- (既无本地记录，服务端报的又是开篇章节——正是从未打开过的书的样子，不能当成
+    --  「续读到这」)
+    reader.state.book.remote_chapter_uid = reader.state.catalog.chapters[2].chapterUid
+    reader.open_book(BOOK_ID, {})
+    vim.wait(20000, function()
+      return picked
+    end, 100)
+    ui.select = real_select
+    truthy(picked, "a fresh book opens the index")
   end)
 
   it("refuses to open a chapter that has no text", function()

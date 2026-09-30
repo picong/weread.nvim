@@ -101,6 +101,11 @@ end
 
 -- ------------------------------------------------------------------ buffers
 
+---Persist the reading position. Assigned further down; declared here because
+---opening a chapter has to record its own position (see display_chapter).
+---(保存阅读位置。定义在下方，此处先声明：打开章节时需要立刻记录目标位置)
+local save_position
+
 ---@param buf integer
 ---@return table|nil
 function M.buffer_info(buf)
@@ -231,13 +236,19 @@ local function setup_window(win)
   vim.wo[win].breakindent = true
   vim.wo[win].list = false
   vim.wo[win].spell = false
-  vim.wo[win].cursorline = true
+  local opts = config.get()
+  -- A highlighted line across a wrapped Chinese paragraph is heavy; the winbar
+  -- plus the line number already tell you where you are.
+  -- (整行高亮压在折行的中文段落上很重；位置由 winbar 与行号就能看出来)
+  vim.wo[win].cursorline = opts.cursorline == true
+  vim.wo[win].cursorlineopt = "both"
   vim.wo[win].conceallevel = 2
   vim.wo[win].concealcursor = "n"
-  local width = tonumber(config.get().text_width) or 0
-  if width > 0 and width < vim.o.columns then
-    vim.wo[win].colorcolumn = tostring(width)
-  end
+  -- Off by default: a colorcolumn line running through the text is the opposite
+  -- of a book page.
+  -- (默认关闭：一条穿过正文的竖线和书页的观感相反)
+  local width = tonumber(opts.text_width) or 0
+  vim.wo[win].colorcolumn = (width > 0 and width < vim.o.columns) and tostring(width) or ""
 end
 
 ---Show a chapter buffer.
@@ -283,6 +294,17 @@ local function display_chapter(book, chapter, index, opts)
     vim.cmd("normal! zz")
   end
 
+  -- Record the destination right away. `nvim_win_set_buf` above already fired
+  -- BufLeave for the chapter being left, and a book keeps a single position
+  -- record — last writer wins. Without this line, switching chapters stores the
+  -- *previous* chapter, which is exactly the "it forgot where I was" symptom.
+  -- (立刻记录目标章节：上面的 nvim_win_set_buf 已经为离开的章节触发过 BufLeave，
+  --  而每本书只存一条位置记录，后写者胜。少了这一行，切章后留下的是上一章，
+  --  正是「记不住我读到哪」的成因)
+  if save_position then
+    save_position()
+  end
+
   local ok, annotations = pcall(require, "weread.annotations")
   if ok and annotations.attach then
     annotations.attach(buf)
@@ -301,16 +323,78 @@ end
 
 -- ------------------------------------------------------------------ fetching
 
+---Resolve a cached image id to its file on disk, if it is there.
+---(把缓存的图片 id 解析成磁盘文件)
+---@param book_id string
+---@param src string
+---@return string|nil
+local function cached_image_path(book_id, src)
+  local id = content.image_id(src)
+  local matches = vim.fn.glob(cache.assets_dir(book_id) .. "/" .. id .. ".*", false, true)
+  return matches[1]
+end
+
+---Render a chapter from the cached source XHTML, without the network.
+---(用缓存的源 XHTML 本地重排一章，不联网)
+---@param book_id string
+---@param chapter table
+---@return boolean ok
+---@return string|nil err
+local function render_from_cache(book_id, chapter)
+  local source = cache.read(cache.chapter_file(book_id, chapter, "xhtml"))
+  if not source or source == "" then
+    return false, "no cached source"
+  end
+  local converted = xhtml.convert(source, {
+    resolve_image = function(src)
+      return cached_image_path(book_id, src)
+    end,
+  })
+  cache.write(cache.chapter_file(book_id, chapter, "md"), converted.text)
+  cache.write_json(cache.chapter_file(book_id, chapter, "map.json"), {
+    map = converted.map,
+    source_runes = converted.source_runes,
+    images = converted.images,
+    renderer = xhtml.VERSION,
+  })
+  return true, nil
+end
+
+---Is the cached chapter rendered by the current renderer?
+---(缓存章节是否由当前渲染器产出)
+---@param book_id string
+---@param chapter table
+---@return boolean
+local function chapter_cache_is_fresh(book_id, chapter)
+  local md = cache.chapter_file(book_id, chapter, "md")
+  if vim.fn.filereadable(md) ~= 1 then
+    return false
+  end
+  local meta = cache.read_json(cache.chapter_file(book_id, chapter, "map.json"))
+  return meta ~= nil and meta.renderer == xhtml.VERSION
+end
+
 ---@param book table
 ---@param chapter table
 ---@param callback fun(ok: boolean, result: string|nil)
 local function ensure_chapter_cached(book, chapter, callback)
-  local md = cache.chapter_file(book.book_id, chapter, "md")
-  local map = cache.chapter_file(book.book_id, chapter, "map.json")
-  if vim.fn.filereadable(md) == 1 and vim.fn.filereadable(map) == 1 then
+  if chapter_cache_is_fresh(book.book_id, chapter) then
     callback(true, nil)
     return
   end
+
+  -- The source XHTML is cached: re-render locally rather than re-downloading.
+  -- This is what makes a typography change reach books that are already
+  -- downloaded.
+  -- (源 XHTML 已缓存，直接本地重排而不是重新下载——这正是让排版调整作用到已下载
+  --  书籍的关键)
+  local rendered, render_err = render_from_cache(book.book_id, chapter)
+  if rendered then
+    log.debug("re-rendered chapter %s from cache", chapter.title)
+    callback(true, nil)
+    return
+  end
+  log.debug("cache unusable for %s (%s); fetching", tostring(chapter.title), tostring(render_err))
 
   local key = tostring(book.book_id) .. ":" .. cache.chapter_key(chapter)
   if state.inflight[key] then
@@ -389,6 +473,7 @@ local function ensure_chapter_cached(book, chapter, callback)
           map = converted.map,
           source_runes = converted.source_runes,
           images = converted.images,
+          renderer = xhtml.VERSION,
         })
         if result.css then
           cache.write(cache.chapter_file(book.book_id, chapter, "css"), result.css)
@@ -441,7 +526,7 @@ function M.open_index(index, opts)
 
   if opts.refresh then
     local key = tostring(state.book.book_id) .. ":" .. cache.chapter_key(chapter)
-    for _, kind in ipairs({ "md", "map.json", "xhtml" }) do
+    for _, kind in ipairs({ "md", "map.json", "xhtml", "css" }) do
       local path = cache.chapter_file(state.book.book_id, chapter, kind)
       if vim.fn.filereadable(path) == 1 then
         vim.uv.fs_unlink(path)
@@ -644,26 +729,90 @@ function M.start_index()
   return 1
 end
 
----Open a book: load it, then either show the TOC or jump straight in.
----(打开一本书：先加载，然后进目录或直接续读)
+---Where the reader left off, from the local record.
+---(本地记录里读到哪了)
+---@param book_id string
+---@return integer|nil index
+---@return table|nil chapter
+function M.saved_position(book_id)
+  local saved = cache.read_position(tostring(book_id))
+  if not saved then
+    return nil, nil
+  end
+  local chapters = (state.catalog or {}).chapters or {}
+  local chapter = chapters[tonumber(saved.chapter_index)]
+  if not chapter or not M.is_readable(chapter) then
+    -- The catalog may have changed under us; fall back to matching the key.
+    -- (目录可能变过，退化为按 key 匹配)
+    for index, candidate in ipairs(chapters) do
+      if cache.chapter_key(candidate) == saved.chapter_key and M.is_readable(candidate) then
+        return index, candidate
+      end
+    end
+    return nil, nil
+  end
+  return tonumber(saved.chapter_index), chapter
+end
+
+---Open a book. Resumes where the reader left off, and only shows the table of
+---contents when there is nothing to resume (or when asked explicitly).
+---(打开一本书：优先续读到上次位置；只有没得续或明确要求时才显示目录)
 ---@param book_id string|number
 ---@param opts table|nil { toc = boolean, refresh = boolean, index = integer }
 function M.open_book(book_id, opts)
   opts = opts or {}
+  book_id = tostring(book_id)
   M.load_book(book_id, { refresh = opts.refresh }, function(ok, book)
     if not ok then
       vim.notify("weread: " .. tostring(book), vim.log.levels.ERROR)
       return
     end
-    vim.notify(
-      string.format("weread: 已加载《%s》(%s)", book.title or "?", book.author or "未知作者"),
-      vim.log.levels.INFO
-    )
+
     if opts.toc then
       M.toc()
       return
     end
-    local index = opts.index or M.start_index()
+
+    local index, chapter = M.saved_position(book_id)
+    local resuming = index ~= nil
+
+    if not index and book.remote_chapter_uid then
+      -- Nothing read on this machine, but the service reports a position. That
+      -- only counts as history when it is actually *past* the opening chapter:
+      -- a book you have never opened still reports chapter 1.
+      -- (本机没读过，但服务端报告了位置。只有确实读过了才算历史——从未打开过的书
+      --  也会报告第一章)
+      -- readable_indices() returns an array: indexing it is not the same as
+      -- taking its first return value.
+      -- (readable_indices() 返回的是数组，取下标和取「第一个返回值」不是一回事)
+      local first_readable = M.readable_indices()[1] or 1
+      local remote_index = M.start_index()
+      if remote_index ~= first_readable then
+        index = remote_index
+        chapter = ((state.catalog or {}).chapters or {})[index]
+        resuming = true
+      end
+    end
+
+    if not resuming then
+      vim.notify(
+        string.format("weread: 《%s》还没有阅读记录，先看目录", book.title or "?"),
+        vim.log.levels.INFO
+      )
+      M.toc()
+      return
+    end
+
+    index = index or M.start_index()
+    chapter = chapter or ((state.catalog or {}).chapters or {})[index]
+    vim.notify(
+      string.format(
+        "weread: 续读《%s》· %s",
+        book.title or "?",
+        (chapter and chapter.title) or ("第 " .. tostring(index) .. " 章")
+      ),
+      vim.log.levels.INFO
+    )
     M.open_index(index, { resume = true })
   end)
 end
@@ -764,7 +913,7 @@ function M.pick_book()
       title = "微信读书 · 书架（" .. #items .. " 本，按最近阅读排序）",
       items = items,
       on_choice = function(item)
-        M.open_book(item.book.book_id, { toc = true })
+        M.open_book(item.book.book_id, {})
       end,
     })
   end)
@@ -795,7 +944,7 @@ function M.search_book(keyword)
       title = "微信读书 · 搜索「" .. keyword .. "」（" .. #items .. " 条）",
       items = items,
       on_choice = function(item)
-        M.open_book(item.book.book_id, { toc = true })
+        M.open_book(item.book.book_id, {})
       end,
     })
   end)
@@ -811,7 +960,7 @@ function M.open_query(query)
     return
   end
   if query:match("^%d+$") or P.is_mp_book(query) then
-    M.open_book(query, { toc = true })
+    M.open_book(query, {})
     return
   end
   if query:match("^https?://") then
@@ -828,8 +977,17 @@ end
 
 ---Persist the reading position when a chapter buffer loses focus.
 ---(章节 buffer 失焦时保存阅读位置)
-local function save_position()
-  local buf = vim.api.nvim_get_current_buf()
+---@param buf_override integer|nil
+save_position = function(buf_override)
+  -- Autocmd callbacks receive the event args table as their first positional
+  -- argument, so anything that is not a number means "the current buffer".
+  -- Reading a table as a buffer number silently made this function return early
+  -- — which is how the reading position ended up frozen at the top of the
+  -- chapter.
+  -- (autocmd 回调会把事件参数表当作第一个位置参数传进来，因此非数字一律视为「当前
+  --   buffer」。把表当 buffer 号会让本函数静默提前返回——阅读位置因此一直停在章节
+  --   开头)
+  local buf = (type(buf_override) == "number" and buf_override) or vim.api.nvim_get_current_buf()
   local info = M.buffer_info(buf)
   if not info then
     return
@@ -842,9 +1000,15 @@ local function save_position()
     total_lines = vim.api.nvim_buf_line_count(buf),
     updated_at = os.time(),
   })
-  -- Leaving a chapter is also the moment to flush reading time; the periodic
-  -- timer would otherwise credit it to whatever comes next.
-  -- (离开章节时同时结算阅读时长；否则定时器会把它记到下一个 buffer 上)
+end
+
+---Leaving a chapter: remember the place and settle the reading time. Kept
+---separate from save_position because opening a chapter records its own
+---position too, and that must not flush progress.
+---(离开章节：记住位置并结算阅读时长。与 save_position 分开，因为打开章节时也会记录
+--- 位置，而那次不应触发进度结算)
+local function on_buf_leave()
+  save_position()
   local ok, progress = pcall(require, "weread.progress")
   if ok then
     pcall(progress.leave, M)
@@ -854,7 +1018,23 @@ end
 local group = vim.api.nvim_create_augroup("weread_reader", { clear = true })
 vim.api.nvim_create_autocmd("BufLeave", {
   group = group,
-  callback = save_position,
+  callback = on_buf_leave,
+})
+-- Also checkpoint while reading, throttled: saving a JSON file on every cursor
+-- hold would be wasteful, but only saving on leave loses the place on a crash.
+-- (阅读中也定期存一次；每次 CursorHold 都写 JSON 太浪费，但只在离开时存又会在
+--  崩溃时丢掉位置)
+local last_checkpoint = 0
+vim.api.nvim_create_autocmd({ "CursorHold", "CursorHoldI" }, {
+  group = group,
+  callback = function()
+    local now = os.time()
+    if now - last_checkpoint < 5 then
+      return
+    end
+    last_checkpoint = now
+    save_position()
+  end,
 })
 vim.api.nvim_create_autocmd({ "WinLeave", "VimLeavePre" }, {
   group = group,

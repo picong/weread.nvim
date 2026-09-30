@@ -585,7 +585,13 @@ function M.login(opts)
       session.uid = data.uid
 
       local payload = BASE .. "/web/confirm?uid=" .. P.urlencode(data.uid)
-      local dialog, dialog_err = qr.show(payload, {
+      -- Rendering the QR touches the terminal, snacks.image, qrencode and a
+      -- float window; any of them can throw. Catch it here so a display
+      -- problem becomes a readable message instead of a raw Lua error in a
+      -- callback, which is how a dead image branch reached a user once.
+      -- (二维码渲染要过终端、snacks.image、qrencode 与浮窗，任一环节都可能抛异；
+      --  在这里接住，让显示问题变成可读提示，而不是回调里的裸 Lua 报错)
+      local shown, dialog, dialog_err = pcall(qr.show, payload, {
         title = "微信读书 · 请用微信扫码" .. (M.is_logged_in() and "（将切换账号）" or ""),
         on_close = function()
           if is_current(session) and state.session == session then
@@ -594,6 +600,10 @@ function M.login(opts)
           end
         end,
       })
+      if not shown then
+        finish(session, "二维码显示失败：" .. tostring(dialog), true)
+        return
+      end
       if not dialog then
         finish(session, "二维码显示失败：" .. tostring(dialog_err), true)
         return

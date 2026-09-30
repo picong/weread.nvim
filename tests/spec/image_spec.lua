@@ -136,6 +136,55 @@ describe("image.mark_lines", function()
   end)
 end)
 
+describe("image.conceal_links", function()
+  it("hides the markdown syntax and leaves the caption visible", function()
+    local buf = vim.api.nvim_create_buf(false, true)
+    local line = "![图 1-6](/home/you/.local/share/nvim/weread/books/43208843/assets/epub_x.png)"
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "正文", line })
+    image.conceal_links(buf)
+
+    local namespace = vim.api.nvim_create_namespace("weread.image.conceal")
+    local marks = vim.api.nvim_buf_get_extmarks(buf, namespace, 0, -1, { details = true })
+    eq(#marks, 2, "one mark for the prefix and one for the path")
+
+    local start_col, end_col, alt = line:find("!%[([^%]]*)%]%(([^%s%)]+)%)")
+    eq(start_col, 1)
+    local concealed = {}
+    for _, mark in ipairs(marks) do
+      local from = mark[3]
+      local to = mark[4].end_col
+      concealed[from] = to
+    end
+    eq(concealed[0], 2, "conceals `![`")
+    eq(concealed[2 + #alt], end_col, "conceals `](path)`")
+
+    -- nothing conceals the alt text itself
+    -- (没有任何标记盖住 caption 文本)
+    truthy(concealed[2] == nil, "the caption stays visible")
+
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+
+  it("handles an image without alt text", function()
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "![](/abs/short.png)" })
+    image.conceal_links(buf)
+    local namespace = vim.api.nvim_create_namespace("weread.image.conceal")
+    local marks = vim.api.nvim_buf_get_extmarks(buf, namespace, 0, -1, { details = true })
+    eq(#marks, 2, "the icon replaces the whole syntax")
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+
+  it("ignores lines that hold no image", function()
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "普通正文", "[普通链接](/x)" })
+    image.conceal_links(buf)
+    local namespace = vim.api.nvim_create_namespace("weread.image.conceal")
+    eq(#vim.api.nvim_buf_get_extmarks(buf, namespace, 0, -1, {}), 0)
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+end)
+
 describe("image.attach", function()
   it("marks the buffer so other renderers can opt out", function()
     local buf = vim.api.nvim_create_buf(false, true)
