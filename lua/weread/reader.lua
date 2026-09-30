@@ -715,7 +715,13 @@ function M.pick_book()
       return
     end
     if #books == 0 then
-      vim.notify("weread: 书架为空", vim.log.levels.INFO)
+      -- An empty shelf should not be a dead end.
+      -- (书架为空时不应该走进死胡同)
+      vim.ui.input({ prompt = "书架为空，搜索书城：" }, function(input)
+        if input and vim.trim(input) ~= "" then
+          M.search_book(vim.trim(input))
+        end
+      end)
       return
     end
 

@@ -19,8 +19,27 @@ local log = require("weread.log")
 
 local M = {}
 
+local DEFAULT_ORIGIN = "https://i.weread.qq.com"
+local DEFAULT_PATH = "/api/agent/gateway"
+
+---Resolve the gateway endpoint.
+---(解析 gateway 端点地址)
+---Accepts either an origin (`https://i.weread.qq.com`) or a full endpoint url.
+---A bare origin used to be posted verbatim, so the request silently landed on
+---"/" and surfaced as a JSON parse error much later; normalising here turns
+---that into a working request.
+---(既接受 origin 也接受完整端点 URL。以前只给 origin 时会原样 POST 到 "/"，
+--- 最后表现为一个很难定位的 JSON 解析错误；在这里归一化掉)
+---@return string
 function M.gateway_url()
-  return config.get().gateway_url or "https://i.weread.qq.com/api/agent/gateway"
+  local configured = config.get().gateway_url
+  if not configured or configured == "" then
+    return DEFAULT_ORIGIN .. DEFAULT_PATH
+  end
+  if configured:match("^https?://[^/]+/?$") then
+    return (configured:gsub("/$", "")) .. DEFAULT_PATH
+  end
+  return configured
 end
 
 ---Call one gateway endpoint.

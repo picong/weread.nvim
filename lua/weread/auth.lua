@@ -195,19 +195,25 @@ end
 
 ---Turn a WeRead error payload into a Chinese action hint.
 ---(把微信读书的错误负载翻译成可执行的中文提示)
+---Field casing differs between services: the web API answers `errCode`,
+---while the Agent gateway answers `errcode`. Both must be understood.
+---(不同服务的字段大小写不一致：网页 API 返回 `errCode`，Agent gateway 返回
+--- `errcode`，两者都要能识别)
 ---@param data table|nil
 ---@return string|nil
 function M.describe_error(data)
   if type(data) ~= "table" then
     return nil
   end
-  local code = tonumber(data.errCode)
+  local code = tonumber(data.errCode or data.errcode)
   if code == -2012 then
     return "登录已过期，请执行 :WeReadLogin 重新扫码"
   elseif code == -2010 then
     return "未登录或凭据无效，请执行 :WeReadLogin"
-  elseif data.errMsg and data.errMsg ~= "" then
-    return tostring(data.errMsg)
+  end
+  local message = data.errMsg or data.errmsg
+  if type(message) == "string" and message ~= "" then
+    return message
   end
   return nil
 end
