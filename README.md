@@ -147,6 +147,31 @@ require("weread").setup({
 - **插图行只显示一个图标与图注**：`![图 1-6](/home/…/assets/epub_x.png)` 显示为 `⧉ 图 1-6`，长缓存路径被 conceal 掉，`<leader>wo` 仍可放大查看。
 - 默认不画 `colorcolumn` 竖线、不高亮整行。
 
+### 行内样式保真
+
+书里的强调不总是 `<b>`：更常见的是样式表里的类（`<span class="calibre3">` +
+`.calibre3{font-weight:700}`）或行内 `style="font-weight:bold"`。插件会解析章节样式表
+（就是分片 `e_2`，已随章节缓存）与行内 style，把它们还原成样式：
+
+| HTML | 阅读时的样子 |
+| --- | --- |
+| `<b>` `<strong>` / `font-weight:bold\|700` | **真加粗**（颜色方案里的 `Bold`） |
+| `<em>` `<i>` / `font-style:italic` | *真斜体*（`Italic`） |
+| `<u>` / `text-decoration:underline` | 下划线（markdown 表达不了，用 extmark 绘制） |
+| `<del>` `<s>` / `line-through` | 删除线 |
+| 有背景色 / `<mark>` | 高亮底色（`WereadMark`） |
+| `<sup>` `<sub>` `<small>` `<code>` | 分别用 `WereadSuperscript` / `WereadSubscript` / `WereadSmall` / `WereadCode` |
+
+两点设计取舍：
+
+- 缓存文件里仍然是**标准 markdown**（`**加粗**`），便于 grep 与移植；阅读时由 extmark
+  把标记 conceal 掉并施加真实属性，所以屏幕上不会出现星号。
+- **标题内不生成强调标记**：markdown 标题本身已经突出，再包一层 `**` 只是徒增待隐藏的
+  标记。
+
+`render-markdown.nvim` 的行内 handler 只处理 code span、链接、图片与 `==高亮==`，
+并不处理强调，因此这里不存在重复渲染。
+
 ### 续读行为
 
 打开一本书时（`:WeRead <书名>` / `:WeReadOpen <bookId>` / `:WeReadResume`）：

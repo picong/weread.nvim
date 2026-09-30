@@ -37,6 +37,20 @@ end
 function M.define_highlights()
   vim.api.nvim_set_hl(0, "WereadMineHighlight", { link = "DiagnosticInfo", default = true })
   vim.api.nvim_set_hl(0, "WereadPopularHighlight", { link = "Comment", default = true })
+  -- inline styling: markdown cannot express these, so they are drawn
+  -- (行内样式：markdown 表达不了，因此用绘制的方式呈现)
+  vim.api.nvim_set_hl(0, "WereadMark", { link = "Search", default = true })
+  vim.api.nvim_set_hl(0, "WereadSuperscript", { link = "Number", default = true })
+  vim.api.nvim_set_hl(0, "WereadSubscript", { link = "Number", default = true })
+  vim.api.nvim_set_hl(0, "WereadSmall", { link = "Comment", default = true })
+  vim.api.nvim_set_hl(0, "WereadCode", { link = "Special", default = true })
+  -- bold/italic/underline/strikethrough are built in, but make sure they carry
+  -- an attribute even under a colorscheme that leaves them plain
+  -- (粗斜体等下划线是内置组，但有些配色把它们留空，这里确保带上属性)
+  vim.api.nvim_set_hl(0, "Bold", { bold = true, default = true })
+  vim.api.nvim_set_hl(0, "Italic", { italic = true, default = true })
+  vim.api.nvim_set_hl(0, "Underline", { underline = true, default = true })
+  vim.api.nvim_set_hl(0, "Strikethrough", { strikethrough = true, default = true })
 end
 
 ---@return boolean

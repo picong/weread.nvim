@@ -149,6 +149,34 @@ describe("reader against a mock server", function()
     eq(vim.fn.filereadable(cache.chapter_file(BOOK_ID, chapter, "css")), 1, "stylesheet cached")
   end)
 
+  it("applies inline styling as attributes instead of visible markdown", function()
+    -- end to end: book stylesheet -> converter -> map.json -> extmarks
+    -- (端到端：书籍样式表 → 转换器 → map.json → extmark)
+    local chapter = reader.state.catalog.chapters[2]
+    local meta = cache.read_json(cache.chapter_file(BOOK_ID, chapter, "map.json"))
+    eq(meta.renderer, require("weread.xhtml").VERSION)
+    truthy(#meta.styles >= 6, "style spans were cached: " .. #(meta.styles or {}))
+
+    local namespace = vim.api.nvim_create_namespace("weread.inline")
+    local marks = vim.api.nvim_buf_get_extmarks(vim.api.nvim_get_current_buf(), namespace, 0, -1, { details = true })
+    truthy(#marks > 0, "styles were drawn")
+
+    local groups = {}
+    local concealed = 0
+    for _, mark in ipairs(marks) do
+      if mark[4].hl_group then
+        groups[mark[4].hl_group] = true
+      end
+      if mark[4].conceal ~= nil then
+        concealed = concealed + 1
+      end
+    end
+    truthy(groups.Bold, "a bold phrase really looks bold")
+    truthy(groups.Italic, "and an italic one italic")
+    truthy(groups.Underline, "underline, which markdown cannot express")
+    truthy(concealed > 0, "the markdown markers are hidden")
+  end)
+
   it("rewrites chapter images to cached local files", function()
     local chapter = reader.state.catalog.chapters[2]
     local md = cache.read(cache.chapter_file(BOOK_ID, chapter, "md"))

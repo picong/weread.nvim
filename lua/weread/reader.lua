@@ -315,6 +315,13 @@ local function display_chapter(book, chapter, index, opts)
     image.attach(buf)
   end
 
+  -- emphasis comes back as real bold/italic instead of visible `**`
+  -- (强调以真正的粗体/斜体呈现，而不是把 `**` 摆在读者眼前)
+  local ok_inline, inline = pcall(require, "weread.inline")
+  if ok_inline and inline.attach then
+    inline.attach(buf, inline.from_meta(cache.read_json(cache.chapter_file(book.book_id, chapter, "map.json"))))
+  end
+
   local ok_progress, progress = pcall(require, "weread.progress")
   if ok_progress then
     progress.enter(require("weread.reader"))
@@ -349,12 +356,16 @@ local function render_from_cache(book_id, chapter)
     resolve_image = function(src)
       return cached_image_path(book_id, src)
     end,
+    -- the book stylesheet is what turns `<span class="...">` back into bold
+    -- (书里的样式表正是让 `<span class="...">` 恢复加粗的依据)
+    css = cache.read(cache.chapter_file(book_id, chapter, "css")),
   })
   cache.write(cache.chapter_file(book_id, chapter, "md"), converted.text)
   cache.write_json(cache.chapter_file(book_id, chapter, "map.json"), {
     map = converted.map,
     source_runes = converted.source_runes,
     images = converted.images,
+    styles = converted.styles,
     renderer = xhtml.VERSION,
   })
   return true, nil
@@ -465,6 +476,7 @@ local function ensure_chapter_cached(book, chapter, callback)
           resolve_image = function(src)
             return id_to_path[content.image_id(src)]
           end,
+          css = result.css,
         })
 
         cache.write(cache.chapter_file(book.book_id, chapter, "xhtml"), result.xhtml)
@@ -473,6 +485,7 @@ local function ensure_chapter_cached(book, chapter, callback)
           map = converted.map,
           source_runes = converted.source_runes,
           images = converted.images,
+          styles = converted.styles,
           renderer = xhtml.VERSION,
         })
         if result.css then

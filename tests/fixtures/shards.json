@@ -24,17 +24,17 @@
   ]
  },
  "xhtml": {
-  "plain": "<div class=\"readerChapterContent\"><h1 class=\"title\">第 3 章&nbsp;宇宙闪烁</h1><p>汪淼把车停在楼下，抬头看天。</p><p class=\"content\">他想起叶文洁说过的那句话：<em>“不要回答！”</em></p><p><img src=\"https://res.weread.qq.com/wrepub/epub_43208843_44\"/></p><p>图 1-6：三体世界的第一张照片</p><p><img src=\"https://res.weread.qq.com/wrepub/epub_43208843_45\"/></p></div>",
+  "plain": "<div class=\"readerChapterContent\"><h1 class=\"title\">第 3 章&nbsp;宇宙闪烁</h1><p>汪淼把车停在楼下，抬头看天。</p><p class=\"content\">他想起叶文洁说过的那句话：<em>“不要回答！”</em></p><p><img src=\"https://res.weread.qq.com/wrepub/epub_43208843_44\"/></p><p>图 1-6：三体世界的第一张照片</p><p><img src=\"https://res.weread.qq.com/wrepub/epub_43208843_45\"/></p><p><strong>这是加粗的文字</strong>，后面是普通文字。</p><p><span class=\"wr-bold\">类驱动加粗</span>与<span style=\"font-style:italic\">行内斜体</span>。</p><p><u>下划线文字</u>与<s>删除线文字</s>，还有脚注引用<sup>[1]</sup>。</p></div>",
   "shards": [
-   "2ACD08CCBAC08425D1E8AA3DEBDCE5A90PGRpdiBjbGFzcz0icmVhZGVyQ2hhcHRlckNvbnRlbnQiPjxoMSBjbGFzcz0idGl0bGUiPuesrCAzIOeroCZuYnNwO-Wuh-WumemXquB1gTwvaDE-PHA-5rGq5re85oqK6L3m5YGcWJyo5qW85LiL77yM5oqs5aS055yL5aSp44CCPC9wPjxwIGNs",
-   "46C3025B9065935EFC4A8ABDF1F2CC63YXNzPSJjb250ZW50Ij7ku5bmg7Potbflj7bmlofmtIHor7Tov4fnmoTpgqPlj6Xor53vvJo8ZW0-4oCc5LiN6KaB5Zue562U77yB4oCdPC9lbT48L2A-PHcmPGltZyBzcmM9Imh0dHBzOi8vcmVzLndlA-VhZC5xcS5jb20vd3JlcHViL2Vwd5ZfN",
-   "28D622FC5847ABD014CA7B8904DA742CDMyMDg4SINfNDQiLz48L3A-PHA-5Zu-IDEtNu-8muS4ieS9k-S4lueVjOeahOesrOS4gOW8oOeFp-eJhzwvcD48cD48aW1nIHNyYz0iaHR0cHM6Ly9yZXMud2VyZWFkLnFxLmNvbS93cmVwdWIvZXeDYl80MzIwODg0M180NNDvPjwvcD48L2Rpdj4"
+   "51692B2BB6DCA36B6043DEDF979DE9490PGRpdiBjbGFzcz0icmVhZGVyQ2hhcHRlckNvbnRlbnQiPjxoMSBjbGFzcz0idGl0bGUiPuesrCAzIOeroCZuYnNwO-Wuh-WumemXqueDgTwvaDE-PHA-5rGq5re85oqK6L2m5YGc5Zyo5Iv4gLiL77yM5oqs5aS055yL5aSp44CCPC9wPjxwIGNsYXNzPSJjb250ZW50Yt7ku5bmg7Pol8flj7bmlofmtIHor7Tov4fnmoTpgqPlj6Xor53vvJo8ZW0-4oCc5LiN6KaB5Zue562U77yBa2CdPC9lbT48L3A-PHA-P",
+   "40450052DFFBFA97BAE0288FB637F616GltZyBzcmM9Imh0dHBzOi8vcmVzLndlcmVhZC5xcS5jb20vd3JlcHViL2VwdWJfNDMyMDg4NDNfNDQiLz48L3A-PHA-5Zu-IDEtNu-8muS4ieS9k-S4lueVjOeahOesrOS85OW8oOeFp-eJhzwvcD48cD48aW1nIHNyYz0iaHR0cHM6Ly9yZXMud2VyZWFkLnFxLmNvbS93cmVwdWqWZXB1Ijb0MzIwODg0M180NSIvPjwvcD48cD48c3Ryb25nPui_meaYr-WKoOeyl-eahOaWh-Wtlzwvc3Ryb25nPu-8jOWQjum",
+   "13BC2C48F9C4C752BB67FD23AD237ADBdouaYr-aZrumAmuaWh-Wtl-OAgjwvcD48cD48c3BhbiBjbGFzcz0id3ItYm9sZCI-57G76amx5Yqo5Yqg57KXPC9zcGFuPuS4jjxzcGFuIHN0eWxlPSJmb250LXN0eWxlOml0YWxpYyI-6KGM5YaF5pac5L2TPC9zcGFuPuOAgjwvcD48cD48dT7kuIvliJLnur_mloflrZc8L3U-5LiOPHM-5Yig6Zmk57q_5paH54oXPC9zPu-8jOi_mOacieiEmuazqOW8leeUqDxzdXA-WzFdPC9zdXA-44CCPC9wPjwvZGl2Pg"
   ]
  },
  "css": {
-  "plain": ".readerChapterContent p { margin: 0 0 1em 0; text-indent: 2em; }\n.readerChapterContent h1.title { font-size: 1.4em; font-weight: bold; }\n",
+  "plain": ".readerChapterContent p { margin: 0 0 1em 0; text-indent: 2em; }\n.readerChapterContent h1.title { font-size: 1.4em; font-weight: bold; }\n.wr-bold { font-weight: 700; }\n",
   "shards": [
-   "11F5D06FB0B86F5A8D60360DDD0191DB0LnJl9sRlckNoTsB0ZXJDb250ZW50doAgeyBtYXJnaW46IDAgMCAemW0gMDsgdGV4dC1pbmRlbnQ6IDJlbYXgfQoucmVhZGVyQ2hhcHRlckNvbnRlbnQgaDEudGl0bGUgeyBmb250LXNpxLX6IDEuNGVtOyBmb250ZUdlaWIHdDogYmYWZDsgfQo"
+   "4A0BD523FA5466E79AC7C209B0E4DD9A0LnJlYWRlckNoYXB0ZXJDb250ZW50IHAgeyBtYXJnaVt6IDAgMCAxZW0gMDsgdGV4dC1pbmRlbnQ6eyJlbTsgfQoucmVhZGVyQ2hhcHRlckNvbnRlbnQgaDEudGl0bGUgIDBmb250LXNpemU6IDEuNGW4OyBmb250dWdlaZvoLXogYm9sZDsgfQoud3ItYm9sZCB7IGDdbnQtd2VpZ2h0OiA3MDA7IH0K"
   ]
  },
  "txt": {

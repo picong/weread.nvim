@@ -140,12 +140,21 @@ XHTML_BODY = (
     '<p><img src="https://res.weread.qq.com/wrepub/epub_43208843_44"/></p>'
     '<p>图 1-6：三体世界的第一张照片</p>'
     '<p><img src="https://res.weread.qq.com/wrepub/epub_43208843_45"/></p>'
+    # emphasis the way books actually express it: a tag, a stylesheet class and
+    # an inline style, plus decorations markdown cannot express at all
+    # (书籍真实的强调写法：标签、样式表类、行内 style，外加 markdown 表达不了的装饰)
+    "<p><strong>这是加粗的文字</strong>，后面是普通文字。</p>"
+    '<p><span class="wr-bold">类驱动加粗</span>与<span style="font-style:italic">行内斜体</span>。</p>'
+    "<p><u>下划线文字</u>与<s>删除线文字</s>，还有脚注引用<sup>[1]</sup>。</p>"
     "</div>"
 )
 
 CHAPTER_CSS = (
     ".readerChapterContent p { margin: 0 0 1em 0; text-indent: 2em; }\n"
     ".readerChapterContent h1.title { font-size: 1.4em; font-weight: bold; }\n"
+    # a class-driven emphasis: the span itself says nothing, the sheet does
+    # (类驱动的强调：span 本身没信息，全靠样式表)
+    ".wr-bold { font-weight: 700; }\n"
 )
 
 TXT_BODY = (

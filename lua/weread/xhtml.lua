@@ -24,6 +24,7 @@ start and end on a text run in practice, and the UI marks whole lines anyway.
 ]]
 
 local config = require("weread.config")
+local css = require("weread.css")
 
 local M = {}
 
@@ -33,7 +34,7 @@ local M = {}
 ---tweak reaches books that are already downloaded.
 ---(渲染结果形态变化时递增（段落处理、缩进、图片语法…）。旧渲染器缓存的章节会用
 --- 已缓存的源 XHTML 在本地重排，不联网，因此排版调整能作用到已下载的书)
-M.VERSION = 2
+M.VERSION = 3
 
 local BLOCK_TAGS = {
   p = true,
@@ -62,6 +63,40 @@ local BLOCK_TAGS = {
 }
 
 local HEADINGS = { h1 = 1, h2 = 2, h3 = 3, h4 = 4, h5 = 5, h6 = 6 }
+
+---Inline elements whose meaning is fixed by the tag itself. `marker` is the
+---markdown syntax written around the content (empty for styles markdown cannot
+---express, which are rendered as extmarks instead).
+---(语义由标签本身决定的元素。marker 是包裹内容的 markdown 语法；markdown 表达不了
+--- 的样式留空，改用 extmark 呈现)
+local INLINE_TAGS = {
+  b = { kind = "bold", marker = "**" },
+  strong = { kind = "bold", marker = "**" },
+  em = { kind = "italic", marker = "*" },
+  i = { kind = "italic", marker = "*" },
+  cite = { kind = "italic", marker = "*" },
+  code = { kind = "code", marker = "`" },
+  tt = { kind = "code", marker = "`" },
+  u = { kind = "underline" },
+  ins = { kind = "underline" },
+  del = { kind = "strike" },
+  s = { kind = "strike" },
+  strike = { kind = "strike" },
+  mark = { kind = "mark" },
+  sup = { kind = "sup" },
+  sub = { kind = "sub" },
+  small = { kind = "small" },
+}
+
+---Style kinds that come out of the stylesheet rather than the tag name.
+---(来自样式表而非标签名的样式种类)
+local STYLE_KINDS = {
+  { key = "bold", kind = "bold", marker = "**" },
+  { key = "italic", kind = "italic", marker = "*" },
+  { key = "underline", kind = "underline" },
+  { key = "strike", kind = "strike" },
+  { key = "mark", kind = "mark" },
+}
 
 local ENTITIES = {
   amp = "&",
@@ -326,8 +361,92 @@ function M.convert(xhtml, opts)
     indent = paragraph.indent,
   })
   local images = {}
+  local styles = {}
   local rune = 0
   local pos = 1
+  local class_styles = opts.styles or css.parse(opts.css)
+
+  -- Open style groups, innermost last. Each entry records where its content
+  -- starts so the closing tag can turn it into a style span over the rendered
+  -- text. Styles cannot span a line break, so those are dropped on close.
+  -- (打开中的样式组，最内层在最后。每项记录内容起点，闭合标签据此生成覆盖渲染文本的
+  --  样式区间。样式不能跨行，因此跨行的会被丢弃)
+  local open_groups = {}
+  -- Headings are already prominent in markdown; wrapping them in `**` only adds
+  -- markers to hide. Styling inside a heading is therefore skipped.
+  -- (markdown 里标题本身就很突出，再包 `**` 只是徒增待隐藏的标记，因此标题内的样式
+  --  一律跳过)
+  local in_heading = false
+
+  ---@param tag_name string
+  ---@param kind string
+  ---@param marker string|nil markdown syntax to wrap the content with
+  local function open_style(tag_name, kind, marker)
+    -- Write any queued paragraph indent first: a style span must start at the
+    -- content, not chew up the indentation.
+    -- (先落下排队中的段落缩进：样式区间必须从内容开始，不能把缩进也吞进去)
+    buffer:flush_indent()
+    if marker then
+      buffer:marker(marker)
+    end
+    local entry = {
+      kind = kind,
+      marker = marker,
+      line = #buffer.lines,
+      col_from = buffer.col,
+    }
+    local group = open_groups[#open_groups]
+    if not group or group.tag ~= tag_name then
+      group = { tag = tag_name, entries = {} }
+      open_groups[#open_groups + 1] = group
+    end
+    group.entries[#group.entries + 1] = entry
+  end
+
+  ---@param tag_name string
+  local function close_styles(tag_name)
+    local found = nil
+    for index = #open_groups, 1, -1 do
+      if open_groups[index].tag == tag_name then
+        found = index
+        break
+      end
+    end
+    if not found then
+      return -- stray closing tag(游离的闭合标签)
+    end
+    -- Close everything above the match too, so a mismatched document cannot
+    -- leave markers unclosed.
+    -- (连上面的一起闭合，避免标签错配留下未闭合的标记)
+    for index = #open_groups, found, -1 do
+      local group = table.remove(open_groups)
+      for entry_index = #group.entries, 1, -1 do
+        local entry = group.entries[entry_index]
+        if entry.line == #buffer.lines and buffer.col > entry.col_from then
+          styles[#styles + 1] = {
+            line = entry.line,
+            col_from = entry.col_from,
+            col_to = buffer.col,
+            kind = entry.kind,
+            markers = entry.marker and #entry.marker or 0,
+          }
+        end
+        if entry.marker then
+          buffer:marker(entry.marker)
+        end
+      end
+    end
+  end
+
+  ---@param style weread.css.Style
+  ---@param tag_name string
+  local function open_from_style(style, tag_name)
+    for _, spec in ipairs(STYLE_KINDS) do
+      if style[spec.key] then
+        open_style(tag_name, spec.kind, spec.marker)
+      end
+    end
+  end
 
   ---@param tag string
   local function handle_tag(tag)
@@ -339,27 +458,29 @@ function M.convert(xhtml, opts)
     end
 
     if close then
-      -- Closing block tags do nothing: the *next* block's separator already
-      -- ends the line, so a paragraph followed by another one stays tight.
-      -- Headings and figures add their own gap.
-      -- (闭合标签不做处理：下一块开始时的分隔已经结束本行，于是相邻段落自然紧凑；
-      --  标题与插图会自己补空行)
+      -- Close any styling this tag opened first, so the closing markers land
+      -- before a block separator ends the line.
+      -- (先闭合本标签打开的样式，让闭合标记落在段落分隔结束本行之前)
+      close_styles(tag_name)
+
+      -- Closing block tags otherwise do nothing: the *next* block's separator
+      -- ends the line, which keeps adjacent paragraphs tight. Headings and
+      -- blockquotes add their own breathing room.
+      -- (除此之外闭合块标签不做处理：下一块开始时的分隔会结束本行，相邻段落因此紧凑；
+      --  标题与引用会自己补留白)
       if HEADINGS[tag_name] then
+        in_heading = false
         buffer:gap()
       elseif tag_name == "blockquote" then
         buffer:separate()
-      elseif tag_name == "em" or tag_name == "i" then
-        buffer:marker("*")
-      elseif tag_name == "strong" or tag_name == "b" then
-        buffer:marker("**")
-      elseif tag_name == "code" or tag_name == "tt" then
-        buffer:marker("`")
       end
       return
     end
 
+    -- ---------------------------------------------------------------- structure
     if HEADINGS[tag_name] then
       buffer:gap()
+      in_heading = true
       local level = math.min(6, math.max(1, HEADINGS[tag_name] + heading_offset))
       buffer:block_marker(string.rep("#", level) .. " ")
     elseif tag_name == "li" then
@@ -377,12 +498,6 @@ function M.convert(xhtml, opts)
       buffer:gap()
       buffer:block_marker("---")
       buffer:gap()
-    elseif tag_name == "em" or tag_name == "i" then
-      buffer:marker("*")
-    elseif tag_name == "strong" or tag_name == "b" then
-      buffer:marker("**")
-    elseif tag_name == "code" or tag_name == "tt" then
-      buffer:marker("`")
     elseif tag_name == "img" then
       local src = attr(tag, "src") or ""
       local alt = M.decode_entities(attr(tag, "alt") or "")
@@ -394,12 +509,28 @@ function M.convert(xhtml, opts)
       buffer:gap()
       buffer:block_marker(string.format("![%s](%s)", alt, resolved))
       buffer:gap()
+      return
     elseif tag_name == "td" or tag_name == "th" then
       if not buffer:is_empty() then
-        buffer:marker(" | ")
+        buffer:block_marker(" | ")
       end
     elseif BLOCK_TAGS[tag_name] then
       buffer:separate()
+    end
+
+    -- ---------------------------------------------------------------- styling
+    -- Emphasis is often expressed as a stylesheet class or an inline style
+    -- rather than `<b>`; resolving both is what keeps bold text bold.
+    -- (强调常常由样式表类或行内 style 表达而不是 `<b>`；两者都解析才能保住加粗)
+    if not in_heading then
+      local tag_style = INLINE_TAGS[tag_name]
+      if tag_style then
+        open_style(tag_name, tag_style.kind, tag_style.marker)
+      end
+      local resolved_style = css.resolve(attr(tag, "class"), attr(tag, "style"), class_styles, tag_name)
+      if not css.is_empty(resolved_style) then
+        open_from_style(resolved_style, tag_name)
+      end
     end
   end
 
@@ -477,6 +608,15 @@ function M.convert(xhtml, opts)
     map = map,
     source_runes = rune,
     images = images,
+    -- Display-only styling: markdown cannot express underline, strike, marks
+    -- or superscript, so those come back as positions the reader draws with
+    -- extmarks. Bold/italic are also listed, so the reader can hide the `**`
+    -- markers and apply a real bold/italic attribute instead of showing
+    -- punctuation.
+    -- (仅供显示的样式：markdown 表达不了下划线/删除线/高亮/上标，因此以位置形式返回，
+    --  由阅读器用 extmark 绘制。粗体与斜体同样列出，这样阅读器可以隐藏 `**` 标记并
+    --  改用真正的粗体/斜体属性，而不是把标点符号摆在那儿)
+    styles = styles,
   }
 end
 
