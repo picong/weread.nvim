@@ -15,7 +15,13 @@ context), where `vim.fn.*` raises E5560. Read fixtures at file scope.
 
 local M = {}
 
-local FIXTURES = vim.fn.getcwd() .. "/tests/fixtures"
+-- Fixtures live next to this helper, not relative to the cwd: the helper is
+-- also loaded from specs that run with a different working directory.
+-- (夹具就在本文件旁边，而不是相对 cwd：本辅助模块也会被工作目录不同的脚本加载)
+local FIXTURES = (function()
+  local source = debug.getinfo(1, "S").source:sub(2)
+  return vim.fs.dirname(source) .. "/fixtures"
+end)()
 
 ---@param name string
 ---@return string
