@@ -83,7 +83,6 @@ function M.check()
   else
     vim.health.info("no credentials.json yet; run :WeReadLogin")
   end
-
   local names = {}
   for _, cookie in ipairs(jar) do
     names[cookie.name] = cookie.value
@@ -110,6 +109,31 @@ function M.check()
     vim.health.warn(string.format("duplicate %s entries in the cookie jar", name), {
       "Stale duplicates can cause `登录超时`; run :WeReadLogin to rebuild the jar.",
     })
+  end
+
+  vim.health.start("weread.nvim: reading")
+  local progress_ok, progress = pcall(require, "weread.progress")
+  if progress_ok then
+    local status = progress.status()
+    if status.enabled then
+      if status.last_error then
+        vim.health.warn("the last progress report failed: " .. tostring(status.last_error))
+      else
+        vim.health.ok("progress reporting is enabled (every " .. tostring(config.get().sync_interval) .. "s)")
+      end
+    else
+      vim.health.info("progress reporting is disabled (sync_interval = 0)")
+    end
+  end
+
+  local reader_ok, reader = pcall(require, "weread.reader")
+  if reader_ok then
+    local book = reader.state.book
+    if book then
+      vim.health.ok(string.format("open book: %s (%s)", book.title or "?", book.book_id))
+    else
+      vim.health.info("no book opened yet")
+    end
   end
 end
 
