@@ -24,6 +24,7 @@ function M.setup(opts)
     path = config.path("weread.log"),
   })
   require("weread.auth").apply_cookies()
+  require("weread.progress").setup()
 
   state.setup = true
   return M

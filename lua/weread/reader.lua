@@ -292,6 +292,11 @@ local function display_chapter(book, chapter, index, opts)
   if ok_image and image.attach then
     image.attach(buf)
   end
+
+  local ok_progress, progress = pcall(require, "weread.progress")
+  if ok_progress then
+    progress.enter(require("weread.reader"))
+  end
 end
 
 -- ------------------------------------------------------------------ fetching
@@ -837,12 +842,35 @@ local function save_position()
     total_lines = vim.api.nvim_buf_line_count(buf),
     updated_at = os.time(),
   })
+  -- Leaving a chapter is also the moment to flush reading time; the periodic
+  -- timer would otherwise credit it to whatever comes next.
+  -- (离开章节时同时结算阅读时长；否则定时器会把它记到下一个 buffer 上)
+  local ok, progress = pcall(require, "weread.progress")
+  if ok then
+    pcall(progress.leave, M)
+  end
 end
 
 local group = vim.api.nvim_create_augroup("weread_reader", { clear = true })
-vim.api.nvim_create_autocmd({ "BufLeave", "WinLeave", "VimLeavePre" }, {
+vim.api.nvim_create_autocmd("BufLeave", {
   group = group,
   callback = save_position,
+})
+vim.api.nvim_create_autocmd({ "WinLeave", "VimLeavePre" }, {
+  group = group,
+  callback = function()
+    local buf = vim.api.nvim_get_current_buf()
+    if M.buffer_info(buf) then
+      pcall(cache.write_position, M.buffer_info(buf).book_id, {
+        chapter_key = M.buffer_info(buf).chapter_key,
+        chapter_index = M.buffer_info(buf).chapter_index,
+        chapter_uid = M.buffer_info(buf).chapter_uid,
+        line = vim.fn.line("."),
+        total_lines = vim.api.nvim_buf_line_count(buf),
+        updated_at = os.time(),
+      })
+    end
+  end,
 })
 
 return M

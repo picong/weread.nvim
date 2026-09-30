@@ -6,7 +6,12 @@ checks the position memory, all against the local mock server.
 
 local mock_lib = dofile(vim.fn.getcwd() .. "/tests/mock.lua")
 
-local tmpdir = vim.fn.tempname()
+-- A fixed data dir (wiped on every run) instead of a random tempdir: when a
+-- test fails, the cache and the debug log are still there to inspect.
+-- (固定数据目录并在每次运行时清空，而不是随机临时目录：测试失败后缓存与日志仍在，
+--  可以直接取证)
+local tmpdir = "/tmp/weread-test-reader"
+vim.fn.delete(tmpdir, "rf")
 vim.fn.mkdir(tmpdir, "p")
 
 -- The catalog fixture carries a {{BASE}} placeholder; the routes read it from
@@ -20,13 +25,24 @@ local config = require("weread.config")
 local http = require("weread.http")
 local cache = require("weread.cache")
 local reader = require("weread.reader")
+local log = require("weread.log")
 
-config.setup({ data_dir = tmpdir, base_url = live.url, proxy = "direct", keymaps = false })
+-- Progress reporting is off here on purpose: this spec counts network traffic,
+-- and reading-time reports are covered by progress_spec.
+-- (本 spec 会统计网络请求数，因此关闭进度回传；阅读时长上报由 progress_spec 覆盖)
+config.setup({
+  data_dir = tmpdir,
+  base_url = live.url,
+  proxy = "direct",
+  keymaps = false,
+  sync_interval = 0,
+})
 config.ensure_dirs()
 http.setup({ jar = config.path("cookies.txt"), tmpdir = config.path("tmp"), timeout = 8, retries = 0, proxy = "direct" })
 http.set_cookies({
   { name = "wr_skey", value = "skey", domain = ".weread.qq.com", path = "/", expires = 0, include_subdomains = true },
 })
+log.setup({ debug = true, path = config.path("weread.log") })
 
 local BOOK_ID = "43208843"
 

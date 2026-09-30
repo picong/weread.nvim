@@ -83,8 +83,26 @@ local function restore(state)
   vim.fn.timer_stop = state.timer_stop
 end
 
+---Wipe every buffer but one, so a spec never inherits chapter buffers,
+---extmarks or buffer-local state from the previous one.
+---(只保留一个空 buffer，避免下一个 spec 继承上一个 spec 的章节 buffer、extmark 或
+--- buffer 局部状态)
+local function reset_editor_state()
+  local keep = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_win_set_buf(0, keep)
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if buf ~= keep then
+      pcall(vim.api.nvim_buf_delete, buf, { force = true })
+    end
+  end
+  pcall(vim.api.nvim_win_set_cursor, 0, { 1, 0 })
+  vim.cmd("silent! only")
+  vim.cmd("silent! enew")
+end
+
 for _, name in ipairs(specs) do
   local state = snapshot()
+  reset_editor_state()
   local ok, err = pcall(dofile, root .. "/tests/spec/" .. name)
   restore(state)
   if not ok then
