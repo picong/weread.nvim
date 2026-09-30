@@ -23,9 +23,19 @@ function M.setup(opts)
     debug = opts.debug == true,
     path = config.path("weread.log"),
   })
+  -- A choice made at runtime (:WeReadTheme / :WeReadFont) wins over the config,
+  -- because it was made later and more deliberately.
+  -- (运行时做出的选择（:WeReadTheme / :WeReadFont）优先于配置：它更晚、也更明确)
+  local prefs = require("weread.prefs")
+  local remembered_theme = prefs.get("theme")
+  if remembered_theme then
+    resolved.theme = remembered_theme
+  end
+
   require("weread.auth").apply_cookies()
   require("weread.progress").setup()
   M.define_highlights()
+  require("weread.theme").define(require("weread.theme").normalize(resolved.theme))
 
   state.setup = true
   return M

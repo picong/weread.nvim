@@ -127,8 +127,11 @@ describe("reader against a mock server", function()
     truthy(buf ~= before, "the chapter replaced the scratch buffer")
 
     local lines = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
-    truthy(lines:find("第 3 章 宇宙闪烁", 1, true), "heading rendered")
     truthy(lines:find("汪淼把车停在楼下", 1, true), "body rendered")
+    -- the chapter title moved to the winbar (asserted below); repeating it in
+    -- the body would only cost two rows
+    -- (章节标题移到了 winbar（下面有断言）；正文里重复只是白花两行)
+    falsy(lines:find("第 3 章 宇宙闪烁", 1, true), "the title is not repeated in the body")
 
     -- window options that make it a reader
     -- (让它成为阅读器的窗口选项)

@@ -233,6 +233,23 @@ describe("xhtml.convert edge cases", function()
   end)
 end)
 
+describe("xhtml.normalize_text", function()
+  it("drops the whitespace that pretty printing leaves between tags", function()
+    -- Real chapters are indented with newlines; emitting those verbatim put
+    -- blank lines inside paragraphs.
+    -- (真实章节用换行做缩进；原样输出会在段落里插入空行)
+    eq(xhtml.normalize_text("\n    ", "\n    "), nil)
+    eq(xhtml.normalize_text("   ", "   "), nil)
+    eq(xhtml.normalize_text("\n", "\n"), nil)
+  end)
+
+  it("collapses inner whitespace and keeps the words", function()
+    eq(xhtml.normalize_text("\n    第一章 测试\n", "\n    第一章 测试\n"), " 第一章 测试 ")
+    eq(xhtml.normalize_text("a\n\nb", "a\n\nb"), "a b")
+    eq(xhtml.normalize_text("正文", "正文"), "正文")
+  end)
+end)
+
 describe("xhtml.convert typesetting", function()
   ---@param count integer
   ---@return string
@@ -282,7 +299,7 @@ describe("xhtml.convert typesetting", function()
     eq(result.text, "　　*注意*后面的正文。")
   end)
 
-  it("keeps blank lines around headings and figures", function()
+  it("keeps a gap before a figure and lets the caption hug it", function()
     local result = xhtml.convert("<h1>标题</h1><p>甲</p><img src=\"/a.png\"/><p>乙</p>", {
       paragraph = { compact = true, indent = "　　" },
     })
@@ -292,9 +309,142 @@ describe("xhtml.convert typesetting", function()
       "　　甲",
       "",
       "![](/a.png)",
-      "",
       "　　乙",
     })
+  end)
+
+  it("can squeeze structural gaps out entirely", function()
+    local result = xhtml.convert("<h1>标题</h1><p>甲</p><img src=\"/a.png\"/><p>乙</p>", {
+      paragraph = { compact = true, indent = "　　", gap = "none" },
+    })
+    eq(lines_of(result.text), {
+      "# 标题",
+      "　　甲",
+      "![](/a.png)",
+      "　　乙",
+    })
+  end)
+
+  it("leaves no stray markers when the dropped title was styled", function()
+    -- The book stylesheet makes the title bold; dropping the heading text must
+    -- drop its markers too.
+    -- (书里的样式表把标题设成加粗；丢掉标题文字时也要把标记一起丢掉)
+    local source = '<h1 class="title">第 3 章 宇宙闪烁</h1><p>正文。</p>'
+    local result = xhtml.convert(source, {
+      skip_title = true,
+      css = "h1.title { font-weight: bold; }",
+    })
+    eq(lines_of(result.text), { "　　正文。" })
+    eq(#result.styles, 0, "and no orphan style span")
+  end)
+
+  it("ignores the pretty printed layout of a real chapter", function()
+    local source = table.concat({
+      "<html><head>",
+      "  <title>版权信息</title>",
+      "  <style>.x { font-weight: bold }</style>",
+      "</head><body>",
+      '  <h1 class="x">版权信息</h1>',
+      '  <p>书名：某本书</p>',
+      '  <hr/>',
+      '  <p>后记</p>',
+      "</body></html>",
+    }, "\n")
+
+    local result = xhtml.convert(source)
+    local lines = vim.split(result.text, "\n", { plain = true })
+
+    -- no stray blanks, no <title> text, no stylesheet text
+    -- (没有多余空行、没有 <title> 文本、没有样式表文本)
+    for index, line in ipairs(lines) do
+      falsy(line:find("font-weight", 1, true), "stylesheet text leaked at line " .. index)
+    end
+    eq(lines[1], "# 版权信息", "the heading survives, unemphasised")
+    -- The `<title>` element repeats the same words; leaking it shows up as a
+    -- second occurrence.
+    -- (<title> 里是同样的文字；若漏出来就会出现第二次)
+    eq(select(2, result.text:gsub("版权信息", "")), 1, "the <title> in <head> is skipped")
+    -- compact layout: no blanks between paragraphs, but a gap around a heading
+    -- and around a rule
+    -- (紧凑版式：段间无空行，但标题与分隔线周围各留一行)
+    eq(lines, {
+      "# 版权信息",
+      "",
+      "　　书名：某本书",
+      "",
+      "---",
+      "",
+      "　　后记",
+    })
+  end)
+
+  it("parses the chapter's own <style> block", function()
+    -- Shape taken from a real chapter (a copyright page): the classes that
+    -- matter are defined inline, and the external book sheet says nothing
+    -- about them.
+    -- (形状取自真实章节（版权页）：关键类定义在行内 style 里，外部书籍样式表没有它们)
+    local source = table.concat({
+      "<html><head><style type=\"text/css\">",
+      ".newCopyRightTitle { font-weight: bold; text-align: center; }",
+      ".newContentCR { text-indent: 0; }",
+      "</style></head><body>",
+      '<h1 class="newCopyRightTitle">版权信息</h1>',
+      '<p class="newContentCR">书名：某本书</p>',
+      '<p><em>斜体</em>与<strong>加粗</strong></p>',
+      "</body></html>",
+    }, "\n")
+
+    local result = xhtml.convert(source, { skip_title = false })
+    -- the heading stays a heading: markdown headings are already prominent, so
+    -- the bold from `.newCopyRightTitle` is deliberately not re-applied
+    -- (标题仍是标题：markdown 标题本就突出，因此不把 `.newCopyRightTitle` 的加粗
+    --  再套一层)
+    truthy(result.text:find("# 版权信息", 1, true), "got: " .. result.text)
+    falsy(result.text:find("**版权信息**", 1, true))
+    truthy(result.text:find("书名：某本书", 1, true))
+    truthy(result.text:find("*斜体*", 1, true))
+    truthy(result.text:find("**加粗**", 1, true))
+    falsy(result.text:find("**>", 1, true), "no stray markers")
+
+    eq(xhtml.inline_stylesheet(source):find("newCopyRightTitle", 1, true) ~= nil, true)
+    eq(xhtml.inline_stylesheet("<p>没有样式块</p>"), "")
+  end)
+
+  it("merges the chapter stylesheet over the book stylesheet", function()
+    -- Different properties combine, as they do in CSS: both rules apply.
+    -- (不同属性会叠加，这与 CSS 一致：两条规则都生效)
+    local source = '<style>.x { font-weight: bold }</style><p class="x">文字</p>'
+    local result = xhtml.convert(source, { css = ".x { font-style: italic }" })
+    truthy(result.text:find("**文字**", 1, true), "chapter rule applied")
+    truthy(result.text:find("*文字*", 1, true), "and the book rule still applies")
+
+    -- The same property resolves in the chapter's favour, because `normal`
+    -- contributes nothing while `bold` does.
+    -- (同一属性以章节为准：`normal` 不贡献任何东西，而 `bold` 会)
+    local overridden = xhtml.convert(
+      '<style>.y { font-weight: bold }</style><p class="y">文字</p>',
+      { css = ".y { font-weight: normal }" }
+    )
+    truthy(overridden.text:find("**文字**", 1, true), "got: " .. overridden.text)
+  end)
+
+  it("drops a chapter title the winbar already shows", function()
+    local source = "<h1 class=\"title\">第 3 章&nbsp;宇宙闪烁</h1><p>正文。</p>"
+    truthy(xhtml.repeats_title(source, "第 3 章 宇宙闪烁"))
+    falsy(xhtml.repeats_title(source, "完全不同的标题"))
+    falsy(xhtml.repeats_title(source, nil))
+
+    local skipped = xhtml.convert(source, { skip_title = true })
+    eq(lines_of(skipped.text), { "　　正文。" }, "the title is gone")
+
+    local kept = xhtml.convert(source, { skip_title = false })
+    eq(lines_of(kept.text), { "# 第 3 章 宇宙闪烁", "", "　　正文。" }, "and kept when asked")
+
+    -- dropping the title must not shift the annotation offsets
+    -- (丢掉标题不能让划线偏移错位)
+    local offset = rune_offset_of(source, "正文。")
+    local resolved = xhtml.resolve(skipped, offset, offset + 3)
+    truthy(resolved, "the body still resolves")
   end)
 
   it("lists items on their own line without indentation", function()

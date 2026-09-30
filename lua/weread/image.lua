@@ -15,6 +15,8 @@ When (1) or (2) is missing the reader still works: image lines get a hint and
 (缺少条件时阅读仍可继续：图片行会加提示，<leader>wo 也会告知文件位置)
 ]]
 
+local log = require("weread.log")
+
 local M = {}
 
 ---@return table|nil snacks_config
@@ -237,6 +239,60 @@ function M.mark_lines(buf)
   end
 end
 
+---Draw the images of a chapter with snacks' placement API, driven by the image
+---lines we can see ourselves.
+---(用 snacks 的 placement API 把章节里的插图画出来，位置由我们自己扫描到的图片行决定)
+---
+---Why not rely on snacks' markdown document mode: it finds images through the
+---treesitter `images` query, which runs against the *injected* `markdown_inline`
+---tree. On this machine that injection never gets parsed (the markdown tree
+---keeps `inline` as an opaque leaf), so document mode silently renders nothing.
+---Driving placements directly depends on nothing but the file being there.
+---(为什么不直接用 snacks 的 markdown 文档模式：它靠 treesitter 的 `images` 查询找图，
+--- 而该查询跑在**注入的** `markdown_inline` 树上。本机上这个注入从未被解析
+--- （markdown 树里的 inline 始终是不透明叶子），于是文档模式静默地什么都不画。
+--- 直接驱动 placement 只依赖文件存在这一件事)
+---@param buf integer
+---@return integer created number of placements created(创建的放置数)
+function M.render_inline(buf)
+  if not M.supports_inline() or not vim.api.nvim_buf_is_valid(buf) then
+    return 0
+  end
+  local ok_placement, placement = pcall(require, "snacks.image.placement")
+  if not ok_placement then
+    return 0
+  end
+
+  -- re-attaching (a re-render, a theme change) must not stack duplicates
+  -- (重新接上（重排、换主题）不能叠加重复的放置)
+  pcall(placement.clean, buf)
+
+  local image_config = (require("weread.config").get().image or {})
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  local created = 0
+
+  for index, line in ipairs(lines) do
+    local path = M.image_in_line(line)
+    if path and vim.fn.filereadable(path) == 1 then
+      local ok = pcall(placement.new, buf, path, {
+        pos = { index, 0 },
+        inline = true,
+        auto_resize = true,
+        type = "image",
+        conceal = false,
+        max_width = image_config.max_width,
+        max_height = image_config.max_height,
+      })
+      if ok then
+        created = created + 1
+      else
+        log.debug("placement failed for %s", path)
+      end
+    end
+  end
+  return created
+end
+
 ---Hook a chapter buffer up for image rendering.
 ---(把章节 buffer 接上图片渲染)
 ---@param buf integer
@@ -246,6 +302,7 @@ function M.attach(buf)
   -- (给用户侧的其它 markdown 渲染器留一个开关)
   vim.b[buf].weread_book = true
   M.conceal_links(buf)
+  M.render_inline(buf)
   M.mark_lines(buf)
 end
 

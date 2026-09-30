@@ -127,6 +127,44 @@ vim.api.nvim_create_user_command("WeReadAnnotations", function(args)
   end
 end, { bang = true, desc = "微信读书：本章划线与想法（! 重新拉取）" })
 
+vim.api.nvim_create_user_command("WeReadTheme", function(args)
+  weread()
+  local theme = require("weread.theme")
+  local name = vim.trim(args.args or "")
+  if name == "" then
+    theme.picker()
+  else
+    theme.set(name)
+  end
+end, { nargs = "?", desc = "微信读书：阅读主题（paper/sepia/light/night/none）" })
+
+vim.api.nvim_create_user_command("WeReadFont", function(args)
+  weread()
+  local font = require("weread.font")
+  local name = vim.trim(args.args or "")
+  if name == "" then
+    font.picker()
+  elseif name == "status" then
+    vim.notify(font.status())
+  elseif name == "list" then
+    local families = font.installed()
+    local float = require("weread.float").open({
+      title = "微信读书 · 本机中文字体（" .. #families .. "）",
+      width = math.min(80, vim.o.columns - 8),
+      height = math.min(#families + 1, vim.o.lines - 8),
+      lines = families,
+    })
+    if float then
+      vim.keymap.set("n", "q", function()
+        float:close()
+      end, { buffer = float:get_buf(), nowait = true, silent = true })
+    end
+  else
+    local ok, message = font.apply(name)
+    vim.notify(message, ok and vim.log.levels.INFO or vim.log.levels.ERROR)
+  end
+end, { nargs = "?", desc = "微信读书：阅读字体（留空选择 / status / list / 字体名）" })
+
 vim.api.nvim_create_user_command("WeReadLog", function()
   local path = require("weread.log").path()
   if path and vim.fn.filereadable(path) == 1 then

@@ -137,7 +137,19 @@ describe("progress.build_payload", function()
     local info = open_chapter()
     FIXTURE.token = reader.state.book.token
 
-    vim.api.nvim_win_set_cursor(0, { 3, 0 })
+    -- locate the paragraph instead of hardcoding a line: the layout changes
+    -- (章节标题是否出现在正文里) must not break this
+    -- (按内容定位而不是写死行号：版式变化不该弄坏这个测试)
+    local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+    local target = nil
+    for index, line in ipairs(lines) do
+      if line:find("汪淼把车停在楼下", 1, true) then
+        target = index
+        break
+      end
+    end
+    truthy(target, "the paragraph is in the buffer")
+    vim.api.nvim_win_set_cursor(0, { target, 0 })
     local payload, err = progress.build_payload(reader, { elapsed_seconds = 30 })
     truthy(payload, tostring(err))
     eq(payload.book_id, info.book_id)
@@ -146,7 +158,14 @@ describe("progress.build_payload", function()
     eq(payload.elapsed_seconds, 30)
     eq(payload.psvts, reader.state.book.psvts)
     truthy(payload.token, "token carried for the sg hash")
-    truthy(payload.chapter_offset > 0, "offset is measured, not zero")
+    -- The offset must grow as the cursor moves down; asserting "> 0" would
+    -- depend on how many lines happen to precede the paragraph.
+    -- (偏移应随光标下移而增大；断言 "> 0" 会依赖段落前面恰好有几行)
+    local first_offset = payload.chapter_offset
+    vim.api.nvim_win_set_cursor(0, { vim.api.nvim_buf_line_count(0), 0 })
+    local later = progress.build_payload(reader, { elapsed_seconds = 30 })
+    truthy(later.chapter_offset > first_offset, "a later position has a larger offset")
+    vim.api.nvim_win_set_cursor(0, { target, 0 })
     matches(payload.summary, "汪淼把车停在楼下")
     truthy(payload.progress >= 0 and payload.progress <= 100)
   end)

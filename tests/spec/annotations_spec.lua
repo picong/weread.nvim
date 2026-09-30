@@ -178,6 +178,22 @@ local function float_lines()
   return vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win), 0, -1, false)
 end
 
+
+---Line number (1-based) holding a needle, so layout changes cannot break a test.
+---(包含某段文字的行号，1 基；避免版式调整把测试弄坏)
+---@param buf integer
+---@param needle string
+---@return integer
+local function line_of(buf, needle)
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  for index, line in ipairs(lines) do
+    if line:find(needle, 1, true) then
+      return index
+    end
+  end
+  error("needle not found: " .. needle)
+end
+
 local function close_float()
   local win = current_float()
   if win then
@@ -324,8 +340,10 @@ describe("annotations popups", function()
   end)
 
   it("says so when there is no highlight nearby", function()
-    open_chapter()
-    vim.api.nvim_win_set_cursor(0, { 1, 0 })
+    local buf = open_chapter()
+    -- the last line is far from any highlight in the fixture
+    -- (夹具里最后一行离任何划线都远)
+    vim.api.nvim_win_set_cursor(0, { vim.api.nvim_buf_line_count(buf), 0 })
     local captured = {}
     local original = vim.notify
     vim.notify = function(message)

@@ -14,7 +14,9 @@
 | 内容层（目录 / 分片解码 / tar 图片解包 / 缓存） | ✅ |
 | XHTML → Markdown 渲染器 + 划线定位用 offset map | ✅ |
 | 阅读器（一章一 buffer、目录、跳章、后台预取、位置记忆） | ✅ |
-| 插图内联渲染（kitty graphics）+ 浮窗放大 | ✅ |
+| 插图内联渲染（自驱 snacks placement，不依赖 treesitter 注入）+ 浮窗放大 | ✅ |
+| 阅读主题（纸色/米黄/素白/夜间，仅作用于章节窗口） | ✅ |
+| 阅读字体选择（列出本机中文字体 → 生成终端片段） | ✅ |
 | 书架 / 搜索 / 书籍信息（官方 Agent API） | ✅ |
 | 阅读进度与时长回传 | ✅ |
 | 划线与想法（我的划线、热门划线、划线下的想法） | ✅ |
@@ -54,7 +56,8 @@
 }
 ```
 
-图片渲染需要在 `snacks.nvim` 中开启 image 模块：
+图片渲染需要 `snacks.nvim` 的 image 模块（**插件的插图由自己驱动 placement 渲染**，
+不依赖 markdown 的 treesitter 注入；把 `doc.inline` 关掉可避免重复渲染）：
 
 ```lua
 {
@@ -62,7 +65,7 @@
   opts = {
     image = {
       enabled = true,
-      doc = { inline = true, max_width = 60, max_height = 30 },
+      doc = { inline = false, max_width = 60, max_height = 14 },
     },
   },
 }
@@ -100,6 +103,8 @@ require("render-markdown").setup({
 | `:WeReadSync` | 立即把进度与时长回传微信读书 |
 | `:WeReadAnnotations[!]` | 本章划线与想法汇总（`!` 重新拉取） |
 | `:WeReadLog` | 查看运行日志 |
+| `:WeReadTheme [名字]` | 阅读主题（paper/sepia/light/night/none） |
+| `:WeReadFont [名字\|status\|list]` | 阅读字体选择 / 状态 / 列表 |
 | `:checkhealth weread` | 自检 |
 
 ## 章节 buffer 内的快捷键
@@ -137,11 +142,55 @@ require("weread").setup({
 })
 ```
 
+### 阅读主题
+
+App 的观感主要来自纸色底与柔和墨色。这些通过 `winhighlight` **只作用于章节窗口**，
+其它窗口仍是你的配色方案：
+
+```vim
+:WeReadTheme          " 选择：paper / sepia / light / night / none
+:WeReadTheme night    " 直接切换（会记住，下次启动沿用）
+```
+
+| 主题 | 底色 | 文字 |
+| --- | --- | --- |
+| `paper`（默认） | `#f6f1e4` | `#3c3733` |
+| `sepia` | `#efe3cd` | `#43382c` |
+| `light` | `#fbfbfb` | `#2f2f2f` |
+| `night` | `#1c1b19` | `#c8c3b8` |
+| `none` | 不改窗口，沿用你的配色 | |
+
+### 阅读字体
+
+终端拥有自己的字体，nvim 无法直接换字形，所以这里做的是能真正做到的部分：
+
+```vim
+:WeReadFont           " 列出本机已装中文字体（按「像书」排序）并选择
+:WeReadFont list      " 只看列表
+:WeReadFont status    " 当前选择与终端情况
+:WeReadFont 思源宋体CN " 直接指定
+```
+
+选中后插件会写出 `~/.config/kitty/weread-font.conf`（`font_family` + 可选字号，
+行距默认注释掉），并提示你在 `kitty.conf` 加一行 `include`（只需一次）：
+
+```conf
+include ~/.config/kitty/weread-font.conf
+```
+
+然后按 `ctrl+shift+F5` 重载配置。若 kitty 开了 `allow_remote_control`，插件会尝试
+`kitten @ load-config` 直接生效。GUI 版 nvim（neovide 等）则直接设置 `guifont` 与
+`linespace`，那是真正的字体控制。
+
+字体选择记在 `preferences.json`，与主题一样下次启动沿用。
+
 ### 排版说明
 
 正文按中文书的样子渲染，而不是按 markdown 的习惯：
 
 - **段间不留空行**，靠首行缩进两格区分段落。原本每段一个空行时，一屏有一半是空白（实测 10 段占 19 行，现在 10 行）。
+- **章节标题不再出现在正文里**（winbar 已经显示书名与章节），每章省两行；若第一个标题与章节标题不一致则保留。
+- **图注紧贴插图**（图前留一空行、图后不留），比之前每图省一行；`paragraph.gap = "none"` 可连标题周围的空行也去掉。
 - 标题、插图、分隔线周围保留空行；列表项独占一行且不缩进。
 - 原文自带全角缩进的 TXT 型书籍不会重复缩进。
 - **插图行只显示一个图标与图注**：`![图 1-6](/home/…/assets/epub_x.png)` 显示为 `⧉ 图 1-6`，长缓存路径被 conceal 掉，`<leader>wo` 仍可放大查看。

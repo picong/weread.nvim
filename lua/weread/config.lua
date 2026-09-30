@@ -27,6 +27,13 @@ M.defaults = {
     ---otherwise eat half of every screen.
     ---(去掉段间空行。中文书靠首行缩进区分段落而不是空行，否则每屏一半是空白)
     compact = true,
+    ---Air around headings, figures and rules: "compact" (default) or "none".
+    ---("compact" 或 "none"：标题/插图/分隔线周围是否留空行)
+    gap = "compact",
+    ---Repeat the chapter title as the first heading. The winbar already shows
+    ---it, so this is off by default and saves two rows per chapter.
+    ---(是否在正文里重复章节标题。winbar 已经显示了，默认关闭，每章省两行)
+    chapter_title = false,
     ---Prefix for the first line of a paragraph. Ignored when the source
     ---already carries its own indent (TXT books ship with full-width spaces).
     ---(段落首行缩进。若原文自带缩进则不再追加——TXT 型书籍本身带全角空格)
@@ -40,6 +47,19 @@ M.defaults = {
   ---(是否高亮光标所在段落)
   ---@type boolean
   cursorline = false,
+
+  ---Reading palette applied to the chapter window only: paper, sepia, light,
+  ---night, or "none" to keep your colorscheme.
+  ---(只作用于章节窗口的阅读配色：paper/sepia/light/night，或 "none" 沿用你的配色)
+  ---@type string
+  theme = "paper",
+
+  ---Preferred reading font. Terminals own their fonts, so this writes a snippet
+  ---you include from your terminal config; GUIs get `guifont` directly.
+  ---(偏好的阅读字体。终端字体由终端掌管，因此这里写出一段供终端 include 的片段；
+  --- GUI 则会直接设置 guifont)
+  ---@type string|nil
+  font = nil,
 
   ---Upload the local position/reading time to WeRead every N seconds. 0 disables it.
   ---(每 N 秒把本地进度与阅读时长回传微信读书，0 表示关闭)
@@ -58,7 +78,7 @@ M.defaults = {
     max_width = 60,
     ---Kept modest on purpose: a tall figure pushes the text off screen.
     ---(刻意克制：太高的插图会把正文挤下去)
-    max_height = 20,
+    max_height = 14,
     ---Icon replacing the markdown image syntax while reading.
     ---(阅读时替换 markdown 图片语法的图标)
     icon = "⧉",

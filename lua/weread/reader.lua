@@ -275,6 +275,11 @@ local function display_chapter(book, chapter, index, opts)
 
   local win = vim.api.nvim_get_current_win()
   setup_window(win)
+  -- repaint this window in the reading palette (chapter only, editor untouched)
+  -- (把该窗口刷成阅读配色：只影响章节窗口，编辑器不受影响)
+  pcall(function()
+    require("weread.theme").apply(win)
+  end)
   local _, total = M.position_of(index)
   set_winbar(win, book, chapter, index, total)
 
@@ -359,6 +364,8 @@ local function render_from_cache(book_id, chapter)
     -- the book stylesheet is what turns `<span class="...">` back into bold
     -- (书里的样式表正是让 `<span class="...">` 恢复加粗的依据)
     css = cache.read(cache.chapter_file(book_id, chapter, "css")),
+    skip_title = xhtml.repeats_title(source, chapter.title),
+    gap = (config.get().paragraph or {}).gap,
   })
   cache.write(cache.chapter_file(book_id, chapter, "md"), converted.text)
   cache.write_json(cache.chapter_file(book_id, chapter, "map.json"), {
@@ -477,6 +484,8 @@ local function ensure_chapter_cached(book, chapter, callback)
             return id_to_path[content.image_id(src)]
           end,
           css = result.css,
+          skip_title = xhtml.repeats_title(result.xhtml, chapter.title),
+          gap = (config.get().paragraph or {}).gap,
         })
 
         cache.write(cache.chapter_file(book.book_id, chapter, "xhtml"), result.xhtml)

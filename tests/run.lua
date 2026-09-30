@@ -98,6 +98,20 @@ local function reset_editor_state()
   pcall(vim.api.nvim_win_set_cursor, 0, { 1, 0 })
   vim.cmd("silent! only")
   vim.cmd("silent! enew")
+  -- Buffer wipes do not reset window-local options, so a spec that painted a
+  -- reading theme would leak it into the next one.
+  -- (清 buffer 不会重置窗口局部选项，画过阅读主题的 spec 会把它漏给下一个 spec)
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if vim.api.nvim_win_get_config(win).relative == "" then
+      pcall(function()
+        vim.wo[win].winhighlight = ""
+        vim.wo[win].foldcolumn = "0"
+        vim.wo[win].colorcolumn = ""
+        vim.wo[win].cursorline = false
+        vim.wo[win].wrap = true
+      end)
+    end
+  end
 end
 
 for _, name in ipairs(specs) do

@@ -193,6 +193,22 @@ end
 ---mention (or when there is no stylesheet at all).
 ---(单个元素的完整样式：样式表里的类 + 行内声明；样式表没提到的类（或压根没有样式表
 --- 时）用类名兜底)
+---Merge two parsed maps; the second wins for the same selector.
+---(合并两张解析后的映射；同一选择器以第二张为准)
+---@param base table<string, weread.css.Style>|nil
+---@param extra table<string, weread.css.Style>|nil
+---@return table<string, weread.css.Style>
+function M.merge_maps(base, extra)
+  local merged = {}
+  for key, style in pairs(base or {}) do
+    merged[key] = style
+  end
+  for key, style in pairs(extra or {}) do
+    merged[key] = M.merge(merged[key], style)
+  end
+  return merged
+end
+
 ---@param class string|nil space separated class attribute
 ---@param style_attr string|nil inline style attribute
 ---@param classes table<string, weread.css.Style>|nil parsed stylesheet

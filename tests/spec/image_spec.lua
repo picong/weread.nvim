@@ -185,6 +185,86 @@ describe("image.conceal_links", function()
   end)
 end)
 
+describe("image.render_inline", function()
+  ---@return integer buf
+  local function image_buffer()
+    local buf = vim.api.nvim_create_buf(false, true)
+    local path = vim.fn.tempname() .. ".png"
+    local file = assert(io.open(path, "wb"))
+    file:write("\137PNG\r\n\26\n")
+    file:close()
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
+      "正文",
+      "![](/does/not/exist.png)",
+      "![](" .. path .. ")",
+    })
+    return buf, path
+  end
+
+  it("does nothing when the terminal cannot show images", function()
+    -- headless has no kitty graphics protocol
+    -- (headless 环境没有 kitty 图形协议)
+    local buf = image_buffer()
+    eq(image.render_inline(buf), 0)
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+
+  it("drives one placement per existing image file", function()
+    local buf, path = image_buffer()
+    local real_supports = image.supports_inline
+    image.supports_inline = function()
+      return true
+    end
+
+    local created = {}
+    local cleaned = 0
+    package.loaded["snacks.image.placement"] = {
+      clean = function()
+        cleaned = cleaned + 1
+      end,
+      new = function(target, src, opts)
+        created[#created + 1] = { buf = target, src = src, opts = opts }
+      end,
+    }
+
+    local count = image.render_inline(buf)
+    image.supports_inline = real_supports
+    package.loaded["snacks.image.placement"] = nil
+
+    eq(count, 1, "only the image whose file exists gets a placement")
+    eq(cleaned, 1, "previous placements are cleared first")
+    eq(created[1].buf, buf)
+    eq(created[1].src, path)
+    eq(created[1].opts.pos[1], 3, "placed on its own line")
+    eq(created[1].opts.inline, true, "inline so it scrolls with the text")
+    eq(created[1].opts.type, "image")
+
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+
+  it("survives a placement implementation that throws", function()
+    local buf = image_buffer()
+    local real_supports = image.supports_inline
+    image.supports_inline = function()
+      return true
+    end
+    package.loaded["snacks.image.placement"] = {
+      clean = function() end,
+      new = function()
+        error("no terminal")
+      end,
+    }
+
+    local ok, count = pcall(image.render_inline, buf)
+    image.supports_inline = real_supports
+    package.loaded["snacks.image.placement"] = nil
+
+    truthy(ok, "a broken renderer must not take the reader down")
+    eq(count, 0, "and reports nothing drawn")
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+end)
+
 describe("image.attach", function()
   it("marks the buffer so other renderers can opt out", function()
     local buf = vim.api.nvim_create_buf(false, true)

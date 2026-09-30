@@ -34,7 +34,7 @@ local M = {}
 ---tweak reaches books that are already downloaded.
 ---(渲染结果形态变化时递增（段落处理、缩进、图片语法…）。旧渲染器缓存的章节会用
 --- 已缓存的源 XHTML 在本地重排，不联网，因此排版调整能作用到已下载的书)
-M.VERSION = 3
+M.VERSION = 4
 
 local BLOCK_TAGS = {
   p = true,
@@ -63,6 +63,17 @@ local BLOCK_TAGS = {
 }
 
 local HEADINGS = { h1 = 1, h2 = 2, h3 = 3, h4 = 4, h5 = 5, h6 = 6 }
+
+---Elements whose contents are metadata, never prose.
+---(内容为元数据、绝非正文的元素)
+local SKIP_BODIES = {
+  style = true,
+  script = true,
+  head = true,
+  title = true,
+  meta = true,
+  link = true,
+}
 
 ---Inline elements whose meaning is fixed by the tag itself. `marker` is the
 ---markdown syntax written around the content (empty for styles markdown cannot
@@ -129,6 +140,80 @@ local ENTITIES = {
 ---(通过统计非续字节来数 rune，测试中与 vim.str_utfindex 对齐验证)
 ---@param text string
 ---@return integer
+---Normalise a text run that sits between tags.
+---(规整位于标签之间的文本段)
+---
+---Real chapters are pretty printed: tags are separated by newlines and
+---indentation, and emitting that verbatim produced stray blank lines inside
+---paragraphs. Pure layout runs are dropped; runs with content have their
+---whitespace collapsed to single spaces, and lose the leading part when they
+---start a line.
+---(真实章节是带缩进换行排版的：直接把标签间的换行当正文输出，会在段落里插入多余空行。
+--- 纯排版用的空白段直接丢弃；含内容的段把空白折叠成单个空格，行首的空白则去掉)
+---@param raw string source text before entity decoding(实体解码前的源文本)
+---@param text string decoded text(解码后的文本)
+---@return string|nil
+function M.normalize_text(raw, text)
+  if vim.trim(raw) == "" then
+    return nil
+  end
+  text = text:gsub("[ \t\r\n]+", " ")
+  if text == " " then
+    return nil
+  end
+  return text
+end
+
+---Plain text of the first heading in a chapter, used to decide whether it is
+---just a repeat of the chapter title the winbar already shows.
+---(章节里第一个标题的纯文本，用于判断它是否只是 winbar 已显示的章节标题)
+---@param xhtml string
+---@return string|nil
+function M.first_heading(xhtml)
+  if type(xhtml) ~= "string" then
+    return nil
+  end
+  local heading = xhtml:match("<h[1-6][^>]*>(.-)</h[1-6]>")
+  if not heading then
+    return nil
+  end
+  heading = heading:gsub("<[^>]*>", "")
+  heading = M.decode_entities(heading)
+  return vim.trim((heading:gsub("%s+", "")):gsub("　", ""))
+end
+
+---The `<style>` blocks a chapter carries. Real chapters ship a couple of
+---kilobytes of chapter-specific CSS this way (the copyright page, poem pages,
+---figure wrappers...), and those classes are the only definition they get.
+---(章节自带的 `<style>` 块。真实章节会这样带上几 KB 的章节专有 CSS（版权页、诗歌页、
+--- 插图容器…），而这些类名的定义只存在于这里)
+---@param source string
+---@return string
+function M.inline_stylesheet(source)
+  local blocks = {}
+  for block in tostring(source or ""):gmatch("<style[^>]*>(.-)</style>") do
+    blocks[#blocks + 1] = block
+  end
+  return table.concat(blocks, "\n")
+end
+
+---Does the first heading merely repeat the chapter title?
+---(第一个标题是否只是章节标题的重复)
+---@param xhtml string
+---@param chapter_title string|nil
+---@return boolean
+function M.repeats_title(xhtml, chapter_title)
+  local heading = M.first_heading(xhtml)
+  if not heading or not chapter_title or chapter_title == "" then
+    return false
+  end
+  local title = vim.trim((chapter_title:gsub("%s+", "")):gsub("　", ""))
+  if title == "" then
+    return false
+  end
+  return heading == title or heading:find(title, 1, true) == 1 or title:find(heading, 1, true) == 1
+end
+
 local function count_runes(text)
   local count = 0
   for index = 1, #text do
@@ -199,6 +284,7 @@ function Buffer.new(opts)
     map = {},
     compact = opts.compact ~= false,
     indent = opts.indent or "",
+    no_gap = opts.no_gap == true,
     pending_indent = false,
   }, Buffer)
 end
@@ -299,6 +385,10 @@ end
 ---breathing room is worth the vertical space.
 ---(强制空行：用于标题/插图/分隔线，这些地方留白值得)
 function Buffer:gap()
+  if self.no_gap then
+    self:newline()
+    return
+  end
   self:newline()
   local lines = self.lines
   if #lines > 0 and lines[#lines] ~= "" then
@@ -356,15 +446,27 @@ function M.convert(xhtml, opts)
   if paragraph == nil then
     paragraph = config.get().paragraph
   end
+  -- How much air to leave around structural elements. The app has none between
+  -- paragraphs and only a little around figures, so "compact" is the default
+  -- and "none" squeezes even that out.
+  -- (结构元素周围留多少白。App 里段间不留白、插图周围只留一点，因此默认 compact，
+  --  想要更紧可以设 none)
+  local gap_mode = opts.gap or paragraph.gap or "compact"
+  local skip_title = opts.skip_title == true
   local buffer = Buffer.new({
     compact = paragraph.compact,
     indent = paragraph.indent,
+    no_gap = gap_mode == "none",
   })
   local images = {}
   local styles = {}
   local rune = 0
   local pos = 1
-  local class_styles = opts.styles or css.parse(opts.css)
+  -- The book stylesheet plus the chapter's own <style> block; the chapter wins,
+  -- because that is what the markup next to it was written against.
+  -- (书籍样式表 + 章节自带的 <style> 块；以章节为准，因为紧跟其后的标记就是照着它写的)
+  local class_styles = opts.styles
+    or css.merge_maps(css.parse(opts.css), css.parse(M.inline_stylesheet(source)))
 
   -- Open style groups, innermost last. Each entry records where its content
   -- starts so the closing tag can turn it into a style span over the rendered
@@ -377,6 +479,8 @@ function M.convert(xhtml, opts)
   -- (markdown 里标题本身就很突出，再包 `**` 只是徒增待隐藏的标记，因此标题内的样式
   --  一律跳过)
   local in_heading = false
+  local skip_heading = false
+  local headings_seen = 0
 
   ---@param tag_name string
   ---@param kind string
@@ -462,6 +566,11 @@ function M.convert(xhtml, opts)
       -- before a block separator ends the line.
       -- (先闭合本标签打开的样式，让闭合标记落在段落分隔结束本行之前)
       close_styles(tag_name)
+      if skip_heading then
+        skip_heading = false
+        in_heading = false
+        return
+      end
 
       -- Closing block tags otherwise do nothing: the *next* block's separator
       -- ends the line, which keeps adjacent paragraphs tight. Headings and
@@ -479,10 +588,19 @@ function M.convert(xhtml, opts)
 
     -- ---------------------------------------------------------------- structure
     if HEADINGS[tag_name] then
-      buffer:gap()
-      in_heading = true
-      local level = math.min(6, math.max(1, HEADINGS[tag_name] + heading_offset))
-      buffer:block_marker(string.rep("#", level) .. " ")
+      headings_seen = headings_seen + 1
+      -- The winbar already shows the book and chapter, so repeating the title
+      -- as the first heading only costs two rows. Later headings carry real
+      -- structure and stay.
+      -- (winbar 已经显示书名与章节，正文里再重复一次标题只是白花两行；后面的标题承担
+      --  真正的结构信息，保留)
+      skip_heading = skip_title and headings_seen == 1
+      if not skip_heading then
+        buffer:gap()
+        in_heading = true
+        local level = math.min(6, math.max(1, HEADINGS[tag_name] + heading_offset))
+        buffer:block_marker(string.rep("#", level) .. " ")
+      end
     elseif tag_name == "li" then
       buffer:separate()
       buffer:block_marker("- ")
@@ -508,7 +626,10 @@ function M.convert(xhtml, opts)
       images[#images + 1] = { src = src, resolved = resolved, alt = alt }
       buffer:gap()
       buffer:block_marker(string.format("![%s](%s)", alt, resolved))
-      buffer:gap()
+      -- No gap after: a caption belongs to its figure, and markdown still parses
+      -- the image as its own paragraph.
+      -- (后面不留空：图注属于插图，且 markdown 仍会把图片解析成独立段落)
+      buffer:newline()
       return
     elseif tag_name == "td" or tag_name == "th" then
       if not buffer:is_empty() then
@@ -522,7 +643,12 @@ function M.convert(xhtml, opts)
     -- Emphasis is often expressed as a stylesheet class or an inline style
     -- rather than `<b>`; resolving both is what keeps bold text bold.
     -- (强调常常由样式表类或行内 style 表达而不是 `<b>`；两者都解析才能保住加粗)
-    if not in_heading then
+    -- A dropped title must not leave its emphasis markers behind either: a
+    -- styled `<h1 class="title">` used to emit a stray `****` on an otherwise
+    -- empty line.
+    -- (被丢弃的标题也不能留下强调标记：带样式的 `<h1 class="title">` 曾经在一行空白上
+    --  留下 `****`)
+    if not in_heading and not skip_heading then
       local tag_style = INLINE_TAGS[tag_name]
       if tag_style then
         open_style(tag_name, tag_style.kind, tag_style.marker)
@@ -543,9 +669,21 @@ function M.convert(xhtml, opts)
     -- text before the tag
     if lt > pos then
       local raw = source:sub(pos, lt - 1)
-      local text = M.decode_entities(raw)
-      buffer:append(text, rune, rune + count_runes(raw))
       rune = rune + count_runes(raw)
+      -- A dropped chapter title must not emit its text either, but its runes
+      -- still count so every later offset stays aligned with the source.
+      -- (被丢弃的章节标题连文字一起丢掉，但 rune 仍要计数，保证后续偏移与源码对齐)
+      if not skip_heading then
+        local decoded = M.normalize_text(raw, M.decode_entities(raw))
+        if decoded then
+          if buffer:is_empty() then
+            decoded = decoded:gsub("^ ", "")
+          end
+          if decoded ~= "" then
+            buffer:append(decoded, rune - count_runes(raw), rune)
+          end
+        end
+      end
     end
 
     if source:sub(lt, lt + 3) == "<!--" then
@@ -553,10 +691,14 @@ function M.convert(xhtml, opts)
       local stop = close and (close + 2) or #source
       rune = rune + count_runes(source:sub(lt, stop))
       pos = stop + 1
-    elseif source:sub(lt + 1, lt + 5):lower() == "style" or source:sub(lt + 1, lt + 6):lower() == "script" then
-      -- skip raw style/script bodies, but keep counting runes so offsets stay
-      -- aligned with the source
-      -- (跳过 style/script 正文，但仍计数 rune 以保持与源码的偏移对齐)
+    elseif SKIP_BODIES[source:sub(lt + 1, lt + 6):lower():match("^(%a+)") or ""] then
+      -- Skip bodies that are not prose: stylesheets, scripts and everything in
+      -- <head>. A real chapter ships `<title>` and a `<style>` block, and both
+      -- used to leak into the text.
+      -- (跳过非正文的元素：样式表、脚本，以及 <head> 里的一切。真实章节带 `<title>`
+      --  与 `<style>`，它们原本都会漏进正文)
+      -- Runes are still counted so offsets stay aligned with the source.
+      -- (rune 仍计数，保证偏移与源码对齐)
       local tag_name = source:sub(lt + 1, lt + 6):lower():match("^(%a+)")
       local close = source:lower():find("</" .. tag_name, lt, true)
       if close then
@@ -583,8 +725,11 @@ function M.convert(xhtml, opts)
   -- trailing text
   if pos <= #source then
     local raw = source:sub(pos)
-    buffer:append(M.decode_entities(raw), rune, rune + count_runes(raw))
     rune = rune + count_runes(raw)
+    local decoded = M.normalize_text(raw, M.decode_entities(raw))
+    if decoded and not skip_heading then
+      buffer:append(decoded, rune - count_runes(raw), rune)
+    end
   end
 
   local text = buffer:get()
