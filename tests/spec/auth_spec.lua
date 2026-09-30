@@ -24,42 +24,63 @@ vim.ui.input = function(opts, on_confirm)
   on_confirm(next_value)
 end
 
--- Deferred callbacks are queued into a stopable timer table instead of running
--- immediately. `vim.fn.timer_stop` cancels them exactly like the real thing, so
--- a stale poll scheduled before a terminal state cannot fire afterwards, and a
--- test can observe the flow between steps.
--- (延迟回调进入可停止的定时器表，而非立即执行；timer_stop 能像真实实现一样取消它，
---  因此终态之前排队的旧轮询不会在之后诈尸，测试也能在步骤之间做观察)
-local timers = {}
-local timer_seq = 0
-vim.defer_fn = function(fn)
-  timer_seq = timer_seq + 1
-  timers[timer_seq] = fn
-  return timer_seq
-end
-vim.fn.timer_stop = function(id)
-  timers[id] = nil
+-- The login flow schedules its polls through weread.timer (which owns uv
+-- handles). The stub below models that contract: queued callbacks that a
+-- `stop` can cancel, so a stale poll scheduled before a terminal state cannot
+-- fire afterwards.
+-- (登录流程通过 weread.timer 调度轮询，它自己持有 uv 句柄。下面的桩复刻该契约：
+--  排队回调可被 stop 取消，因此终态之前排队的旧轮询不会在之后诈尸)
+local fake_timer = { queue = {}, next_id = 0 }
+
+function fake_timer.defer(fn)
+  fake_timer.next_id = fake_timer.next_id + 1
+  local handle = { id = fake_timer.next_id, fn = fn, cancelled = false }
+  fake_timer.queue[#fake_timer.queue + 1] = handle
+  return handle
 end
 
----Run every queued timer until none is left.
----(把所有排队的定时器跑完)
+fake_timer.every = fake_timer.defer
+
+function fake_timer.stop(handle)
+  if type(handle) == "table" then
+    handle.cancelled = true
+  end
+end
+
+---Run every queued timer callback until none is left.
+---(把所有排队的定时器回调跑完)
 ---@param limit integer|nil
 local function drain(limit)
   limit = limit or 50
   local count = 0
   while true do
-    local id, fn = next(timers)
-    if not id then
+    local handle
+    for index, candidate in ipairs(fake_timer.queue) do
+      if not candidate.cancelled then
+        handle = candidate
+        table.remove(fake_timer.queue, index)
+        break
+      end
+    end
+    if not handle then
       break
     end
-    timers[id] = nil
     count = count + 1
     if count > limit then
       error("timers did not settle: the poll never reached a terminal state")
     end
-    fn()
+    handle.fn()
   end
   return count
+end
+
+package.loaded["weread.timer"] = fake_timer
+
+-- vim.defer_fn still backs the API-key retry, which only needs to run soon.
+-- (vim.defer_fn 仍用于 API Key 重试，只需尽快执行即可)
+vim.defer_fn = function(fn)
+  fn()
+  return 0
 end
 
 local fake_http = {
@@ -155,9 +176,7 @@ local function reset()
   fake_http.jar = {}
   fake_qr.shown = {}
   scripted_input = { "1234" }
-  for key in pairs(timers) do
-    timers[key] = nil
-  end
+  fake_timer.queue = {}
   auth.cancel()
   -- credentials are cached in module state, so nuke the file and the cache
   -- (凭据被模块状态缓存，这里同时清掉文件与缓存)

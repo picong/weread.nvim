@@ -299,10 +299,8 @@ local function set_title(session, title)
 end
 
 local function stop_timer(session)
-  if session.timer then
-    pcall(vim.fn.timer_stop, session.timer)
-    session.timer = nil
-  end
+  require("weread.timer").stop(session.timer)
+  session.timer = nil
 end
 
 local function close_dialog(session)
@@ -340,8 +338,8 @@ local function schedule_poll(session)
   if not is_current(session) then
     return
   end
-  stop_timer(session)
-  session.timer = vim.defer_fn(function()
+  require("weread.timer").stop(session.timer)
+  session.timer = require("weread.timer").defer(function()
     session.timer = nil
     M._poll(session)
   end, POLL_INTERVAL_MS)

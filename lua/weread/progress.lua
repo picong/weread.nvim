@@ -304,10 +304,8 @@ end
 -- ------------------------------------------------------------------ timer
 
 local function stop_timer()
-  if state.timer then
-    pcall(vim.fn.timer_stop, state.timer)
-    state.timer = nil
-  end
+  require("weread.timer").stop(state.timer)
+  state.timer = nil
 end
 
 local function schedule()
@@ -316,13 +314,11 @@ local function schedule()
     return
   end
   local interval_ms = math.max(5000, (tonumber(config.get().sync_interval) or 60) * 1000)
-  state.timer = vim.defer_fn(function()
-    state.timer = nil
+  state.timer = require("weread.timer").every(function()
     -- Always tick: with a non-chapter buffer this only advances the clock so
     -- that time spent elsewhere is not credited as reading.
     -- (总是 tick：不在章节 buffer 时只推进计时点，不把别处的时间算作阅读)
     M.tick(require("weread.reader"))
-    schedule()
   end, interval_ms)
 end
 
