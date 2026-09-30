@@ -126,17 +126,8 @@ end
 ---(当前能否用图片渲染)
 ---@return boolean
 function M.image_supported()
-  local ok, snacks = pcall(require, "snacks")
-  if not ok or type(snacks) ~= "table" or not snacks.config or not snacks.config.image then
-    return false
-  end
-  if snacks.config.image.enabled == false then
-    return false
-  end
-  local ok_support, supported = pcall(function()
-    return require("snacks.image").supports_terminal()
-  end)
-  return ok_support and supported == true
+  local ok, image = pcall(require, "weread.image")
+  return ok and image.supports_inline()
 end
 
 ---@class weread.qr.Dialog

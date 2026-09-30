@@ -287,6 +287,11 @@ local function display_chapter(book, chapter, index, opts)
   if ok and annotations.attach then
     annotations.attach(buf)
   end
+
+  local ok_image, image = pcall(require, "weread.image")
+  if ok_image and image.attach then
+    image.attach(buf)
+  end
 end
 
 -- ------------------------------------------------------------------ fetching

@@ -1,6 +1,6 @@
 --[[
-Command registration. Commands pull their modules in on demand so that opening
-nvim costs nothing but a few `require` calls.
+Command registration. Commands pull their modules in on demand, so opening nvim
+costs nothing but a few `require` calls.
 (命令注册：按需加载模块，启动时只付出少量 require 的代价)
 ]]
 
@@ -105,24 +105,45 @@ vim.api.nvim_create_user_command("WeReadRefresh", function()
   require("weread.reader").reload()
 end, { desc = "微信读书：重新抓取当前章节" })
 
+vim.api.nvim_create_user_command("WeReadSync", function()
+  local ok, progress = pcall(require, "weread.progress")
+  if not ok then
+    vim.notify("weread: 进度模块未加载", vim.log.levels.WARN)
+    return
+  end
+  progress.sync_now()
+end, { desc = "微信读书：立即回传阅读进度" })
+
+vim.api.nvim_create_user_command("WeReadAnnotations", function(args)
+  local ok, annotations = pcall(require, "weread.annotations")
+  if not ok then
+    vim.notify("weread: 划线模块未加载", vim.log.levels.WARN)
+    return
+  end
+  if args.bang then
+    annotations.refresh(true)
+  else
+    annotations.show_chapter_summary()
+  end
+end, { bang = true, desc = "微信读书：本章划线与想法（! 重新拉取）" })
+
 vim.api.nvim_create_user_command("WeReadLog", function()
-  local config = require("weread.config")
   local path = require("weread.log").path()
   if path and vim.fn.filereadable(path) == 1 then
     vim.cmd("edit " .. vim.fn.fnameescape(path))
-  else
-    local lines = require("weread.log").tail(200)
-    local float = require("weread.float").open({
-      title = "weread.nvim 日志（内存，共 " .. #lines .. " 行）",
-      width = math.min(100, vim.o.columns - 8),
-      height = math.min(30, vim.o.lines - 8),
-      lines = #lines > 0 and lines or { "（暂无日志；在 setup({ debug = true }) 后写入文件）" },
-      filetype = "log",
-    })
-    if float then
-      vim.keymap.set("n", "q", function()
-        float:close()
-      end, { buffer = float:get_buf(), nowait = true, silent = true })
-    end
+    return
   end
-end, { desc = "微信读书：查看运行日志" })", "oldText": "--[[\nCommand registration. Commands pull their modules in on demand so that\n`:WeReadLogin` costs nothing but a `require` at startup.\n(命令注册：按需加载模块，启动时只付出一次 require 的代价)\n]]\n\nif vim.g.loaded_weread_nvim then\n  return\nend\nvim.g.loaded_weread_nvim = 1\n\nlocal function weread()\n  local plugin = require(\"weread\")\n  plugin.ensure_setup()\n  return plugin\nend\n\nvim.api.nvim_create_user_command(\"WeReadLogin\", function(args)\n  if args.bang then\n    require(\"weread.auth\").logout()\n  end\n  weread().login({ force = args.bang })\nend, { bang = true, desc = \"微信读书：扫码登录（! 先清除旧凭据）\" })\n\nvim.api.nvim_create_user_command(\"WeReadLogout\", function()\n  weread().logout()\nend, { desc = \"微信读书：退出登录并清除本地凭据\" })\n\nvim.api.nvim_create_user_command(\"WeReadLog\", function()\n  local config = require(\"weread.config\")\n  local path = require(\"weread.log\").path()\n  if path and vim.fn.filereadable(path) == 1 then\n    vim.cmd(\"edit \" .. vim.fn.fnameescape(path))\n  else\n    local lines = require(\"weread.log\").tail(200)\n    local float = require(\"weread.float\").open({\n      title = \"weread.nvim 日志（内存，共 \" .. #lines .. \" 行）\",\n      width = math.min(100, vim.o.columns - 8),\n      height = math.min(30, vim.o.lines - 8),\n      lines = #lines > 0 and lines or { \"（暂无日志；在 setup({ debug = true }) 后写入文件）\" },\n      filetype = \"log\",\n    })\n    if float then\n      vim.keymap.set(\"n\", \"q\", function()\n        float:close()\n      end, { buffer = float:get_buf(), nowait = true, silent = true })\n    end\n  end\nend, { desc = \"微信读书：查看运行日志\" })"}]
+  local lines = require("weread.log").tail(200)
+  local float = require("weread.float").open({
+    title = string.format("weread.nvim 日志（内存，共 %d 行）", #lines),
+    width = math.min(100, vim.o.columns - 8),
+    height = math.min(30, vim.o.lines - 8),
+    lines = #lines > 0 and lines or { "暂无日志；在 setup({ debug = true }) 之后会写入文件" },
+    filetype = "log",
+  })
+  if float then
+    vim.keymap.set("n", "q", function()
+      float:close()
+    end, { buffer = float:get_buf(), nowait = true, silent = true })
+  end
+end, { desc = "微信读书：查看运行日志" })
