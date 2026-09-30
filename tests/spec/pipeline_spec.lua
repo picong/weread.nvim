@@ -17,20 +17,15 @@ local http = require("weread.http")
 local log = require("weread.log")
 local protocol = require("weread.protocol")
 
+local mock_lib = dofile(vim.fn.getcwd() .. "/tests/mock.lua")
+
 local FIXTURES = vim.fn.getcwd() .. "/tests/fixtures"
 
 local function fixture_text(name)
-  return table.concat(vim.fn.readfile(FIXTURES .. "/" .. name), "\n")
+  return mock_lib.fixture_text(name)
 end
 
-local function fixture_bytes(name)
-  local file = io.open(FIXTURES .. "/" .. name, "rb")
-  local data = file:read("*a")
-  file:close()
-  return data
-end
-
-local shards = vim.json.decode(fixture_text("shards.json"))
+local shards = mock_lib.shards()
 
 -- Fixtures are read once, on the main loop. Doing it inside a route handler
 -- would run in a libuv callback, where `vim.fn.readfile` raises E5560.
@@ -38,112 +33,13 @@ local shards = vim.json.decode(fixture_text("shards.json"))
 local FIXTURE = {
   reader = fixture_text("reader.html"),
   catalog = fixture_text("catalog.json"),
-  tar = fixture_bytes("images.tar"),
+  tar = mock_lib.fixture_bytes("images.tar"),
 }
 
 -- ------------------------------------------------------------------ mock
 
----Start a tiny HTTP/1.1 server. `routes` is an ordered list of
----{ path = "<substring>", handler = fun(method, path, body, headers) }.
----(启动一个极小的 HTTP/1.1 服务；routes 为按顺序匹配的路由表)
----@param routes table[]
----@return table server { port, requests, stop }
-local function start_mock(routes)
-  local server = vim.uv.new_tcp()
-  assert(server:bind("127.0.0.1", 0), "could not bind the mock server")
-  local port = server:getsockname().port
-  local requests = {}
-
-  server:listen(128, function(listen_err)
-    if listen_err then
-      return
-    end
-    local client = vim.uv.new_tcp()
-    server:accept(client)
-    local chunks = {}
-
-    client:read_start(function(read_err, data)
-      if read_err or not data then
-        pcall(function()
-          client:close()
-        end)
-        return
-      end
-      chunks[#chunks + 1] = data
-      local raw = table.concat(chunks)
-      local header_end = raw:find("\r\n\r\n", 1, true)
-      if not header_end then
-        return
-      end
-
-      local head = raw:sub(1, header_end - 1)
-      local body = raw:sub(header_end + 4)
-      local length = tonumber(head:match("[Cc]ontent%-[Ll]ength:%s*(%d+)")) or 0
-      if #body < length then
-        return -- keep reading the body (继续读 body)
-      end
-      client:read_stop()
-
-      local method, path = head:match("^(%u+)%s+(%S+)")
-      path = (path or ""):gsub("%?.*$", "")
-      body = body:sub(1, length)
-      requests[#requests + 1] = { method = method, path = path, body = body, headers = head }
-
-      local response = { status = 404, ctype = "text/plain", body = "not found" }
-      for _, route in ipairs(routes) do
-        if path:find(route.path, 1, true) then
-          response = route.handler(method, path, body, head) or response
-          break
-        end
-      end
-
-      local payload = table.concat({
-        "HTTP/1.1 " .. tostring(response.status),
-        "Content-Type: " .. response.ctype,
-        "Content-Length: " .. #response.body,
-        "Connection: close",
-        "",
-        response.body,
-      }, "\r\n")
-
-      client:write(payload, function()
-        pcall(function()
-          client:close()
-        end)
-      end)
-    end)
-  end)
-
-  return {
-    port = port,
-    requests = requests,
-    url = "http://127.0.0.1:" .. port,
-    stop = function()
-      pcall(function()
-        server:close()
-      end)
-    end,
-  }
-end
-
----@param body string
----@return boolean
----@return string
-local function signature_is_valid(body)
-  local ok, params = pcall(vim.json.decode, body)
-  if not ok or type(params) ~= "table" then
-    return false, "body is not JSON"
-  end
-  local claimed = params.s
-  if type(claimed) ~= "string" or claimed == "" then
-    return false, "no signature in the request body"
-  end
-  local expected = protocol.sign(protocol.sorted_query(params))
-  if expected ~= claimed then
-    return false, string.format("signature mismatch: sent %s, expected %s", claimed, expected)
-  end
-  return true, ""
-end
+local start_mock = mock_lib.start
+local signature_is_valid = mock_lib.signature_is_valid
 
 ---Run an async function and block until its callback fires.
 ---(运行异步函数并阻塞到回调触发)
@@ -171,77 +67,12 @@ end
 local tmpdir = vim.fn.tempname()
 vim.fn.mkdir(tmpdir, "p")
 
--- Declare first, assign second: the route handlers below capture `mock` as an
+-- Declare first, assign second: the route handlers capture `mock` as an
 -- upvalue, and a local only enters scope after its declaration statement.
--- (先声明再赋值：下面的路由处理器把 mock 当上值捕获，而局部变量的作用域始于其声明
---  语句之后)
-local mock
-mock = start_mock({
-  {
-    path = "/web/reader/",
-    handler = function()
-      return { status = 200, ctype = "text/html", body = FIXTURE.reader }
-    end,
-  },
-  {
-    path = "/web/book/chapterInfos",
-    handler = function(method, _, body)
-      if method ~= "POST" then
-        return { status = 405, ctype = "text/plain", body = "POST only" }
-      end
-      if not body:find("43208843", 1, true) then
-        return { status = 400, ctype = "text/plain", body = "missing bookIds" }
-      end
-      -- {{BASE}} resolves to whatever port the mock ended up on
-      -- ({{BASE}} 解析为 mock 实际监听的地址)
-      return { status = 200, ctype = "application/json", body = FIXTURE.catalog:gsub("{{BASE}}", mock.url) }
-    end
-  },
-  {
-    path = "/web/book/chapter/e_0",
-    handler = function(_, _, body)
-      local ok, err = signature_is_valid(body)
-      if not ok then
-        return { status = 400, ctype = "text/plain", body = "bad signature: " .. err }
-      end
-      return { status = 200, ctype = "text/plain", body = shards.xhtml.shards[1] }
-    end,
-  },
-  {
-    path = "/web/book/chapter/e_1",
-    handler = function()
-      return { status = 200, ctype = "text/plain", body = shards.xhtml.shards[2] }
-    end,
-  },
-  {
-    path = "/web/book/chapter/e_3",
-    handler = function()
-      return { status = 200, ctype = "text/plain", body = shards.xhtml.shards[3] }
-    end,
-  },
-  {
-    path = "/web/book/chapter/e_2",
-    handler = function(_, _, body)
-      local params = vim.json.decode(body)
-      if params.st ~= 1 then
-        return { status = 400, ctype = "text/plain", body = "the css shard needs st=1" }
-      end
-      return { status = 200, ctype = "text/plain", body = shards.css.shards[1] }
-    end,
-  },
-  {
-    path = "/wrco/tar_",
-    handler = function()
-      return { status = 200, ctype = "application/octet-stream", body = FIXTURE.tar }
-    end,
-  },
-  {
-    path = "/web/book/chapterInfos",
-    handler = function()
-      return { status = 500, ctype = "text/plain", body = "unreachable" }
-    end,
-  },
-})
+-- (先声明再赋值：路由处理器把 mock 当上值捕获，而局部变量的作用域始于其声明语句之后)
+local ref = {}
+local mock = mock_lib.start(mock_lib.weread_routes(ref))
+ref.url = mock.url
 
 config.setup({ data_dir = tmpdir, base_url = mock.url, proxy = "direct" })
 config.ensure_dirs()
