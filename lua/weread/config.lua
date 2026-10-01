@@ -101,6 +101,14 @@ M.defaults = {
   ---@type string
   gateway_url = "https://i.weread.qq.com",
 
+  ---How many thoughts to list per highlight in the chapter summary popup.
+  ---A well annotated chapter carries dozens, and a wall of them buries the
+  ---highlights; `K` shows all of them for one highlight.
+  ---(章节汇总里每条划线最多列几条想法。被划得多的章节动辄几十条，全铺开会把划线本身
+  --- 埋掉；想细看某一条按 K)
+  ---@type integer
+  summary_thoughts = 3,
+
   ---Register the default buffer-local keymaps in chapter buffers.
   ---(在章节 buffer 注册默认快捷键)
   ---@type boolean

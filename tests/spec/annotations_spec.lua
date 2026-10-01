@@ -369,6 +369,129 @@ describe("annotations popups", function()
   end)
 end)
 
+describe("annotations popups with real shaped data", function()
+  ---A thought exactly as the service returns it: several paragraphs in one
+  ---string, plus an author that is a plain name.
+  ---(与服务端返回完全一致的想法：一个字符串里含多个自然段，作者是普通名字)
+  local MULTI_PARAGRAPH = "上次研究这个，还是2006年了。在机房度过的无数个日日夜夜。。。\n\n"
+    .. "GNU=GNU's Not Unix，强调免费使用\n\nGNU工具链包括多个关键组件。"
+
+  ---@param annotations table[]
+  ---@return integer buf
+  local function chapter_with(annotations)
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "第一行", "第二行" })
+    vim.b[buf].weread = { book_id = BOOK_ID, chapter_key = "0002", chapter_index = 2, chapter_uid = "2" }
+    vim.api.nvim_win_set_buf(0, buf)
+    vim.b[buf].weread_annotations = annotations
+    return buf
+  end
+
+  it("lays out a multi paragraph thought in the summary", function()
+    local buf = chapter_with({
+      {
+        line = 1,
+        annotation = {
+          range = "10-20",
+          text = "Linux系统可划分为以下4部分。",
+          mine = false,
+          popular = true,
+          count = 44,
+          thoughts = { { author = "老鱼", time = 1749283552, content = MULTI_PARAGRAPH } },
+        },
+      },
+    })
+
+    local ok, err = pcall(annotations.show_chapter_summary)
+    truthy(ok, "the summary must not raise: " .. tostring(err))
+
+    local lines = float_lines()
+    truthy(#lines > 0, "the popup opened")
+    local text = table.concat(lines, "\n")
+    truthy(text:find("44人划线", 1, true), "the highlight is listed")
+    truthy(text:find("想法 1", 1, true), "the counts line accounts for the single thought")
+    truthy(text:find("老鱼：上次研究这个", 1, true), "the first paragraph starts the entry")
+    truthy(text:find("GNU工具链包括多个关键组件。", 1, true), "later paragraphs are kept")
+    falsy(text:find("\n\nGNU工具链", 1, true), "and none of them arrive glued together")
+    -- continuation lines are indented under their author
+    -- (续行缩进在作者名下)
+    local indented = false
+    for _, line in ipairs(lines) do
+      if line:find("^        GNU", 1) then
+        indented = true
+      end
+    end
+    truthy(indented, "continuation lines are indented")
+
+    close_float()
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+
+  it("caps the thoughts per highlight and says how many are left", function()
+    local many = {}
+    for index = 1, 7 do
+      many[#many + 1] = { author = "读者" .. index, content = "想法" .. index }
+    end
+    local buf = chapter_with({
+      {
+        line = 0,
+        annotation = { range = "10-20", text = "被划得很多的一句", mine = false, popular = true, count = 30, thoughts = many },
+      },
+    })
+
+    annotations.show_chapter_summary()
+    local text = table.concat(float_lines(), "\n")
+    truthy(text:find("读者1", 1, true), "the first thoughts are listed")
+    truthy(text:find("读者3", 1, true))
+    falsy(text:find("读者4", 1, true), "later ones are left to the K popup")
+    truthy(text:find("另有 4 条想法", 1, true), "and the count is honest: " .. text:sub(1, 200))
+
+    close_float()
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+
+  it("works on the chapter buffer even when a popup holds the focus", function()
+    local buf = chapter_with({
+      {
+        line = 0,
+        annotation = { range = "10-20", text = "第一行划线", mine = true, popular = false, count = 0, thoughts = {} },
+      },
+    })
+
+    -- open a popup first: the current buffer is now the float
+    -- (先打开一个弹窗：当前 buffer 变成浮窗)
+    annotations.show_chapter_summary()
+    truthy(current_float(), "a popup is open")
+    eq(vim.api.nvim_get_current_buf() == buf, false, "the float holds the focus")
+
+    -- the summary must still find the chapter, not the float
+    -- (汇总仍应找到章节 buffer，而不是浮窗)
+    local ok, err = pcall(annotations.show_chapter_summary)
+    truthy(ok, tostring(err))
+    truthy(table.concat(float_lines(), "\n"):find("我的划线", 1, true), "the chapter's highlights are shown")
+
+    close_float()
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+
+  it("explains itself when used outside a chapter", function()
+    local plain = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_win_set_buf(0, plain)
+
+    local captured = {}
+    local original = vim.notify
+    vim.notify = function(message)
+      captured[#captured + 1] = message
+    end
+    annotations.show_thoughts_at_cursor()
+    vim.notify = original
+
+    truthy(#captured > 0)
+    truthy(captured[1]:find("章节 buffer", 1, true) ~= nil, "got: " .. tostring(captured[1]))
+    vim.api.nvim_buf_delete(plain, { force = true })
+  end)
+end)
+
 describe("annotations.refresh", function()
   it("refetches when asked", function()
     open_chapter()

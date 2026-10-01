@@ -399,9 +399,8 @@ end
 ---@param refresh boolean|nil
 function M.refresh(refresh)
   local reader = require("weread.reader")
-  local buf = vim.api.nvim_get_current_buf()
-  local info = reader.buffer_info(buf)
-  if not info then
+  local buf, info = M.chapter_buffer()
+  if not buf or not info then
     vim.notify("weread: 当前不在章节 buffer 中", vim.log.levels.WARN)
     return
   end
@@ -481,6 +480,10 @@ end
 ---(显示光标处划线下的想法)
 function M.show_thoughts_at_cursor()
   local buf = vim.api.nvim_get_current_buf()
+  if not require("weread.reader").buffer_info(buf) then
+    vim.notify("weread: 请在章节 buffer 里用 K 查看划线处的想法", vim.log.levels.WARN)
+    return
+  end
   local line = vim.api.nvim_win_get_cursor(0)[1] - 1
   local found = M.annotations_on_line(buf, line)
   if #found == 0 then
@@ -506,10 +509,42 @@ function M.show_thoughts_at_cursor()
   })
 end
 
+---The chapter buffer to operate on.
+---(要操作的章节 buffer)
+---Popups steal the "current buffer", so a command that looks at the current
+---buffer right after a popup opened would silently work on the wrong one.
+---(弹窗会抢走「当前 buffer」，因此弹窗打开后再看当前 buffer 会静默作用于错误的 buffer)
+---@return integer|nil buf
+---@return table|nil info
+function M.chapter_buffer()
+  local reader = require("weread.reader")
+  local current = vim.api.nvim_get_current_buf()
+  local info = reader.buffer_info(current)
+  if info then
+    return current, info
+  end
+
+  local best, best_info, best_used = nil, nil, -1
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    local buf_info = reader.buffer_info(buf)
+    if buf_info then
+      local used = vim.fn.getbufinfo(buf)[1].lastused or 0
+      if used > best_used then
+        best, best_info, best_used = buf, buf_info, used
+      end
+    end
+  end
+  return best, best_info
+end
+
 ---A popup listing every highlight of the chapter.
 ---(列出本章全部划线的弹窗)
 function M.show_chapter_summary()
-  local buf = vim.api.nvim_get_current_buf()
+  local buf = M.chapter_buffer()
+  if not buf then
+    vim.notify("weread: 当前不在章节 buffer 中", vim.log.levels.WARN)
+    return
+  end
   local resolved = vim.b[buf].weread_annotations
   if not resolved then
     vim.notify("weread: 本章划线尚未加载", vim.log.levels.INFO)
@@ -532,9 +567,26 @@ function M.show_chapter_summary()
     end
     thoughts_total = thoughts_total + #(annotation.thoughts or {})
 
-    lines[#lines + 1] = string.format("%s  %s", M.label(annotation), annotation.text or "")
-    for _, thought in ipairs(annotation.thoughts or {}) do
-      lines[#lines + 1] = string.format("    %s：%s", thought.author or "匿名", thought.content or "")
+    lines[#lines + 1] = string.format("%s  %s", M.label(annotation), vim.trim(annotation.text or ""))
+
+    local thoughts = annotation.thoughts or {}
+    local limit = tonumber(require("weread.config").get().summary_thoughts) or 3
+    local leftover = #thoughts - limit
+    for index = 1, math.min(limit, #thoughts) do
+      local thought = thoughts[index]
+      -- Thoughts are multi paragraph often enough that they must be laid out
+      -- as such; the float splits them, this indents the continuation lines.
+      -- (想法经常是好几个自然段，必须按段落铺开：float 负责拆行，这里给续行加缩进)
+      local body = vim.split(tostring(thought.content or ""), "\n", { plain = true })
+      lines[#lines + 1] = string.format("    %s：%s", thought.author or "匿名", vim.trim(body[1] or ""))
+      for body_index = 2, #body do
+        if vim.trim(body[body_index]) ~= "" then
+          lines[#lines + 1] = "        " .. vim.trim(body[body_index])
+        end
+      end
+    end
+    if leftover > 0 then
+      lines[#lines + 1] = string.format("    …另有 %d 条想法（在这条划线处按 K 查看）", leftover)
     end
     lines[#lines + 1] = ""
   end
