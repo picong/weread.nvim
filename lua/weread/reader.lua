@@ -324,7 +324,8 @@ local function display_chapter(book, chapter, index, opts)
   -- (强调以真正的粗体/斜体呈现，而不是把 `**` 摆在读者眼前)
   local ok_inline, inline = pcall(require, "weread.inline")
   if ok_inline and inline.attach then
-    inline.attach(buf, inline.from_meta(cache.read_json(cache.chapter_file(book.book_id, chapter, "map.json"))))
+    local meta = cache.read_json(cache.chapter_file(book.book_id, chapter, "map.json"))
+    inline.attach(buf, inline.from_meta(meta), meta and meta.headings)
   end
 
   local ok_progress, progress = pcall(require, "weread.progress")
@@ -373,6 +374,7 @@ local function render_from_cache(book_id, chapter)
     source_runes = converted.source_runes,
     images = converted.images,
     styles = converted.styles,
+    headings = converted.headings,
     renderer = xhtml.VERSION,
   })
   return true, nil
@@ -495,6 +497,7 @@ local function ensure_chapter_cached(book, chapter, callback)
           source_runes = converted.source_runes,
           images = converted.images,
           styles = converted.styles,
+          headings = converted.headings,
           renderer = xhtml.VERSION,
         })
         if result.css then

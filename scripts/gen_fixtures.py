@@ -146,6 +146,10 @@ XHTML_BODY = (
     "<p><strong>这是加粗的文字</strong>，后面是普通文字。</p>"
     '<p><span class="wr-bold">类驱动加粗</span>与<span style="font-style:italic">行内斜体</span>。</p>'
     "<p><u>下划线文字</u>与<s>删除线文字</s>，还有脚注引用<sup>[1]</sup>。</p>"
+    # a real sub-heading, so heading rendering is covered end to end
+    # (一个真正的小标题，让标题渲染也有端到端覆盖)
+    "<h2>一、小标题</h2>"
+    "<p>小标题后的正文。</p>"
     "</div>"
 )
 

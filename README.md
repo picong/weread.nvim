@@ -196,6 +196,21 @@ include ~/.config/kitty/weread-font.conf
 - **插图行只显示一个图标与图注**：`![图 1-6](/home/…/assets/epub_x.png)` 显示为 `⧉ 图 1-6`，长缓存路径被 conceal 掉，`<leader>wo` 仍可放大查看。
 - 默认不画 `colorcolumn` 竖线、不高亮整行。
 
+### 标题与正文统一底色
+
+`#` / `##` / `###` 标题原本会带着**配色方案给的背景色**显示（实测你机器上
+`@markup.heading.1.markdown` 自带 `bg=#2c314a`，render-markdown 又叠了自己的
+`RenderMarkdownH1Bg`），在纸色页面上就是一条条色带。两道处理：
+
+1. **窗口重映射**：阅读窗口的 `winhighlight` 把所有给 markdown 上色的组
+   （`@markup.*.markdown` 与 `RenderMarkdown*`，动态枚举而非写死）都换成纸色组，
+   背景回到纸色；
+2. **阅读器自己画标题行**：`weread.inline` 用一个高优先级 extmark 覆盖整行
+   （`WereadHeading` = 墨色 + 纸色底 + 粗体），并把 `#` 标记 conceal 掉。
+
+这样无论配色方案或渲染插件怎么上色，标题就是「加粗的正文」——和 App 里一样。
+`theme = "none"` 时 `WereadHeading` 会退回跟随 `Title` 的前景色，不带背景。
+
 ### 行内样式保真
 
 书里的强调不总是 `<b>`：更常见的是样式表里的类（`<span class="calibre3">` +

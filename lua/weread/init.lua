@@ -54,6 +54,10 @@ function M.define_highlights()
   vim.api.nvim_set_hl(0, "WereadSubscript", { link = "Number", default = true })
   vim.api.nvim_set_hl(0, "WereadSmall", { link = "Comment", default = true })
   vim.api.nvim_set_hl(0, "WereadCode", { link = "Special", default = true })
+  -- Drawn on heading lines by weread.inline; the theme overrides it with the
+  -- page colours when a reading palette is active.
+  -- (由 weread.inline 画在标题行上；启用阅读配色时主题会用纸页颜色覆盖它)
+  vim.api.nvim_set_hl(0, "WereadHeading", { bold = true, default = true })
   -- bold/italic/underline/strikethrough are built in, but make sure they carry
   -- an attribute even under a colorscheme that leaves them plain
   -- (粗斜体等下划线是内置组，但有些配色把它们留空，这里确保带上属性)

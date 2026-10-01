@@ -53,6 +53,83 @@ describe("theme palettes", function()
   end)
 end)
 
+describe("theme foreign markdown groups", function()
+  it("puts the page background back under headings and fences", function()
+    -- render-markdown.nvim paints headings with its own background (that is
+    -- what made a heading line look like a coloured band), so a couple of its
+    -- groups are faked here.
+    -- (render-markdown.nvim 用自己的背景画标题——这正是标题行看起来像色带的原因。
+    --  这里伪造它的几个组)
+    vim.api.nvim_set_hl(0, "RenderMarkdownH1Bg", { bg = 0x2c314a, fg = 0xffffff, bold = true })
+    vim.api.nvim_set_hl(0, "RenderMarkdownH2Bg", { bg = 0x38343d, fg = 0xffffff })
+    vim.api.nvim_set_hl(0, "RenderMarkdownH3", { fg = 0x89b4fa })
+    vim.api.nvim_set_hl(0, "RenderMarkdownCode", { bg = 0x1e2030 })
+    vim.api.nvim_set_hl(0, "RenderMarkdownQuote", { fg = 0xf9e2af })
+    vim.api.nvim_set_hl(0, "RenderMarkdownBullet", { fg = 0x89dceb })
+    vim.api.nvim_set_hl(0, "UnrelatedGroup", { bg = 0x112233 })
+    -- the treesitter groups are the other half of the problem: they ship a
+    -- background too
+    -- (treesitter 的组是问题的另一半：它们同样自带背景)
+    vim.api.nvim_set_hl(0, "@markup.heading.1.markdown", { bg = 0x2c314a, fg = 0x82aaff })
+    vim.api.nvim_set_hl(0, "@markup.strong.markdown", { fg = 0xffc777, bold = true })
+    vim.api.nvim_set_hl(0, "@markup.heading.1.html", { bg = 0x2c314a })
+
+    local groups = theme.foreign_groups()
+    truthy(#groups >= 8, "found the syntax groups: " .. #groups)
+    eq(vim.tbl_contains(groups, "UnrelatedGroup"), false, "and nothing else")
+    eq(vim.tbl_contains(groups, "@markup.heading.1.markdown"), true, "treesitter markdown groups are included")
+    eq(vim.tbl_contains(groups, "@markup.heading.1.html"), false, "other languages are left alone")
+
+    eq(theme.substitute("RenderMarkdownH1Bg"), "WereadPaperHeading")
+    eq(theme.substitute("RenderMarkdownH7"), "WereadPaperHeading")
+    eq(theme.substitute("RenderMarkdownCodeBorder"), "WereadPaperCode")
+    eq(theme.substitute("RenderMarkdownQuote1"), "WereadPaperQuote")
+    eq(theme.substitute("RenderMarkdownLink"), "WereadPaperLinkBg")
+    eq(theme.substitute("RenderMarkdownBullet"), "WereadPaperMuted")
+    eq(theme.substitute("@markup.heading.1.markdown"), "WereadPaperHeading")
+    eq(theme.substitute("@markup.heading.6.markdown"), "WereadPaperHeading")
+    eq(theme.substitute("@markup.strong.markdown"), "WereadPaperStrong")
+    eq(theme.substitute("@markup.italic.markdown"), "WereadPaperItalic")
+    eq(theme.substitute("@markup.raw.block.markdown"), "WereadPaperCode")
+    eq(theme.substitute("@markup.quote.markdown"), "WereadPaperQuote")
+    eq(theme.substitute("@markup.link.url.markdown"), "WereadPaperLinkBg")
+  end)
+
+  it("maps them to groups that carry the paper background", function()
+    theme.define("paper")
+    local paper_bg = tonumber(theme.palettes.paper.bg:sub(2), 16)
+
+    for _, group in ipairs({
+      "WereadPaperHeading",
+      "WereadPaperCode",
+      "WereadPaperMuted",
+      "WereadPaperLinkBg",
+      "WereadPaperStrong",
+      "WereadPaperItalic",
+    }) do
+      eq(vim.api.nvim_get_hl(0, { name = group }).bg, paper_bg, group .. " must not form a band")
+    end
+    eq(vim.api.nvim_get_hl(0, { name = "WereadPaperHeading" }).bold, true, "headings stay bold")
+
+    local value = theme.winhighlight("paper")
+    truthy(value:find("RenderMarkdownH1Bg:WereadPaperHeading", 1, true) ~= nil, "got: " .. value)
+    truthy(value:find("RenderMarkdownCode:WereadPaperCode", 1, true) ~= nil)
+    truthy(
+      value:find("@markup.heading.1.markdown:WereadPaperHeading", 1, true) ~= nil,
+      "the treesitter heading group is remapped too"
+    )
+  end)
+
+  it("follows the palette when switching themes", function()
+    theme.define("night")
+    eq(
+      vim.api.nvim_get_hl(0, { name = "WereadPaperHeading" }).bg,
+      tonumber(theme.palettes.night.bg:sub(2), 16)
+    )
+    theme.define("paper")
+  end)
+end)
+
 describe("theme.apply", function()
   ---@return integer buf
   local function chapter_buffer()

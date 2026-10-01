@@ -111,6 +111,65 @@ describe("xhtml.convert styling", function()
   end)
 end)
 
+describe("inline.render_headings", function()
+  it("paints the whole heading line and hides the hash marks", function()
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "# 小标题", "正文" })
+    local drawn = inline.render_headings(buf, { { line = 0, level = 1 } })
+    eq(drawn, 1)
+
+    local marks = marks_of(buf)
+    local span, conceal = nil, nil
+    for _, mark in ipairs(marks) do
+      if mark[4].hl_group == "WereadHeading" then
+        span = mark
+      elseif mark[4].conceal ~= nil then
+        conceal = mark
+      end
+    end
+
+    truthy(span, "a heading span")
+    eq(span[2], 0, "on the heading line")
+    eq(span[3], 0, "covering from the first column")
+    eq(span[4].end_col, #"# 小标题", "to the end of the line")
+    -- (hl_mode/priority are render-time options and are not echoed back by
+    --  nvim_buf_get_extmarks, so the group name is what we can assert here)
+    -- (hl_mode/priority 是渲染期选项，nvim_buf_get_extmarks 不会回传，因此这里能断言的
+    --  是组名)
+
+    truthy(conceal, "the `#` are hidden")
+    eq(conceal[3], 0)
+    eq(conceal[4].end_col, 2, "`# ` is concealed")
+
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+
+  it("handles deeper levels and ignores out-of-range lines", function()
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "### 三级", "正文" })
+    inline.render_headings(buf, {
+      { line = 0, level = 3 },
+      { line = 99, level = 1 },
+    })
+    local marks = marks_of(buf)
+    local concealed_end = nil
+    for _, mark in ipairs(marks) do
+      if mark[4].conceal ~= nil then
+        concealed_end = mark[4].end_col
+      end
+    end
+    eq(concealed_end, 4, "`### ` is concealed")
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+
+  it("survives missing arguments", function()
+    local buf = vim.api.nvim_create_buf(false, true)
+    eq(inline.render_headings(buf, nil), 0)
+    eq(inline.attach(buf, nil, nil), 0)
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+end)
+
 describe("inline.attach", function()
   ---@return integer buf
   local function styled_buffer()
@@ -187,6 +246,20 @@ describe("inline.attach", function()
     local line = vim.split(CONVERTED.text, "\n", { plain = true })[underline.line + 1]
     eq(line:sub(1, 6), "　　", "the line is indented")
     eq(line:sub(underline.col_from + 1, underline.col_to), "下划线文字")
+  end)
+
+  it("paints headings when asked", function()
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "## 标题", "正文" })
+    inline.attach(buf, {}, { { line = 0, level = 2 } })
+    local found = false
+    for _, mark in ipairs(marks_of(buf)) do
+      if mark[4].hl_group == "WereadHeading" then
+        found = true
+      end
+    end
+    truthy(found, "the heading was painted")
+    vim.api.nvim_buf_delete(buf, { force = true })
   end)
 
   it("does nothing without styles, or on an invalid buffer", function()

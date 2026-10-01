@@ -80,6 +80,23 @@ function M.normalize(name)
   return "paper"
 end
 
+---The heading group drawn on heading lines by weread.inline.
+---(由 weread.inline 画在标题行上的标题组)
+---@param name string
+function M.define_heading(name)
+  if name == "none" then
+    -- No palette: stay close to the colorscheme, minus any background.
+    -- (不套配色：贴近配色方案，但去掉背景)
+    local title = vim.api.nvim_get_hl(0, { name = "Title" })
+    vim.api.nvim_set_hl(0, "WereadHeading", { fg = title.fg, bold = true })
+    return
+  end
+  local palette = M.palettes[name]
+  if palette then
+    vim.api.nvim_set_hl(0, "WereadHeading", { fg = palette.fg, bg = palette.bg, bold = true })
+  end
+end
+
 ---Define the highlight groups a palette needs. Idempotent, so switching themes
 ---at runtime just rewrites them.
 ---(定义一套配色所需的高亮组。幂等，运行时切换主题就是重写它们)
@@ -99,6 +116,84 @@ function M.define(name)
   set(0, "WereadPaperQuote", { fg = palette.muted, italic = true })
   set(0, "WereadPaperStrike", { fg = palette.muted, strikethrough = true })
   set(0, "WereadPaperSuperscript", { fg = palette.muted })
+
+  -- Markdown decorations must not punch a coloured hole in the page. These are
+  -- what other plugins paint their own headings, fences and tables with, and
+  -- they all get the page background back.
+  -- (markdown 装饰不能在纸页上打出彩色空洞。其它插件用它画标题、代码块、表格，
+  --  这里统一把背景换回纸色)
+  set(0, "WereadPaperHeading", { fg = palette.fg, bg = palette.bg, bold = true })
+  set(0, "WereadPaperMuted", { fg = palette.muted, bg = palette.bg })
+  set(0, "WereadPaperCode", { fg = palette.muted, bg = palette.bg })
+  set(0, "WereadPaperLinkBg", { fg = palette.link, bg = palette.bg, underline = true })
+  set(0, "WereadPaperStrong", { fg = palette.fg, bg = palette.bg, bold = true })
+  set(0, "WereadPaperItalic", { fg = palette.fg, bg = palette.bg, italic = true })
+  M.define_heading(name)
+end
+
+---Groups that colour markdown syntax, from either a renderer plugin or the
+---treesitter queries themselves.
+---(给 markdown 语法上色的高亮组，可能来自渲染插件，也可能来自 treesitter 查询本身)
+---
+---Both matter: the visible band behind a heading came from the *colorscheme's*
+---`@markup.heading.1.markdown` (which ships a background), and render-markdown
+---adds its own `RenderMarkdownH*Bg` on top.
+---(两者都要管：标题行那条色带来自**配色方案**的 `@markup.heading.1.markdown`
+---（自带背景色），render-markdown 又在上面叠了自己的 `RenderMarkdownH*Bg`)
+-- patterns are matched against the lowercased group name, so they are lowercase
+-- (模式针对小写化的组名匹配，因此这里全部小写)
+local SUBSTITUTIONS = {
+  { match = "^@markup%.heading", group = "WereadPaperHeading" },
+  { match = "^rendermarkdownh%d", group = "WereadPaperHeading" },
+  { match = "heading", group = "WereadPaperHeading" },
+  { match = "strong", group = "WereadPaperStrong" },
+  { match = "bold", group = "WereadPaperStrong" },
+  { match = "italic", group = "WereadPaperItalic" },
+  { match = "strikethrough", group = "WereadPaperStrike" },
+  { match = "quote", group = "WereadPaperQuote" },
+  { match = "raw", group = "WereadPaperCode" },
+  { match = "^rendermarkdowncode", group = "WereadPaperCode" },
+  { match = "link", group = "WereadPaperLinkBg" },
+  { match = "list", group = "WereadPaperMuted" },
+}
+
+---Highlight groups that other markdown renderers define for themselves.
+---(其它 markdown 渲染器自定义的高亮组)
+---Enumerated at apply time rather than hardcoded: the set grows with plugin
+---releases (`H1`..`H7`, `Bg` variants, `Code*`, `Quote1..8`, ...).
+---(在应用时枚举而不是写死：这套组会随插件版本增长（H1..H7、Bg 变体、Code*、
+--- Quote1..8……）)
+---@return string[]
+function M.foreign_groups()
+  local groups = {}
+  local ok, all = pcall(vim.api.nvim_get_hl, 0, {})
+  if not ok or type(all) ~= "table" then
+    return groups
+  end
+  for name in pairs(all) do
+    if name:find("^RenderMarkdown") or (name:find("^@markup%.") and name:find("%.markdown$")) then
+      groups[#groups + 1] = name
+    end
+  end
+  table.sort(groups)
+  return groups
+end
+
+---Which paper group should stand in for a foreign one.
+---(某个外部组应当换成哪个纸色组)
+---@param group string
+---@return string
+function M.substitute(group)
+  local lowered = group:lower()
+  for _, rule in ipairs(SUBSTITUTIONS) do
+    if lowered:find(rule.match) then
+      return rule.group
+    end
+  end
+  if lowered:find("info") or lowered:find("hint") or lowered:find("success") then
+    return "WereadPaperLinkBg"
+  end
+  return "WereadPaperMuted"
 end
 
 ---`winhighlight` value that repaints a window in the given palette.
@@ -110,7 +205,8 @@ function M.winhighlight(name)
     return ""
   end
   M.define(name)
-  return table.concat({
+
+  local pairs_list = {
     "Normal:WereadPaperNormal",
     "EndOfBuffer:WereadPaperNormal",
     "WinBar:WereadPaperWinBar",
@@ -122,7 +218,15 @@ function M.winhighlight(name)
     "WereadSubscript:WereadPaperSuperscript",
     "WereadSmall:WereadPaperQuote",
     "Strikethrough:WereadPaperStrike",
-  }, ",")
+  }
+
+  -- Third party markdown decorations: same page background, palette foreground.
+  -- (第三方 markdown 装饰：同样的纸色底，前景取自配色)
+  for _, group in ipairs(M.foreign_groups()) do
+    pairs_list[#pairs_list + 1] = group .. ":" .. M.substitute(group)
+  end
+
+  return table.concat(pairs_list, ",")
 end
 
 ---Current theme name from the config.

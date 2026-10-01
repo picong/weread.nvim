@@ -299,6 +299,21 @@ describe("xhtml.convert typesetting", function()
     eq(result.text, "　　*注意*后面的正文。")
   end)
 
+  it("records heading lines for the reader to paint", function()
+    local result = xhtml.convert("<h1>一级</h1><p>正文</p><h3>三级</h3>")
+    eq(#result.headings, 2)
+    eq(result.headings[1].level, 1)
+    eq(result.headings[2].level, 3)
+    local lines = vim.split(result.text, "\n", { plain = true })
+    eq(lines[result.headings[1].line + 1], "# 一级")
+    eq(lines[result.headings[2].line + 1], "### 三级")
+  end)
+
+  it("does not record headings the winbar already shows", function()
+    local result = xhtml.convert("<h1>第 1 章</h1><p>正文</p>", { skip_title = true })
+    eq(#result.headings, 0)
+  end)
+
   it("keeps a gap before a figure and lets the caption hug it", function()
     local result = xhtml.convert("<h1>标题</h1><p>甲</p><img src=\"/a.png\"/><p>乙</p>", {
       paragraph = { compact = true, indent = "　　" },

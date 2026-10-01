@@ -34,7 +34,7 @@ local M = {}
 ---tweak reaches books that are already downloaded.
 ---(渲染结果形态变化时递增（段落处理、缩进、图片语法…）。旧渲染器缓存的章节会用
 --- 已缓存的源 XHTML 在本地重排，不联网，因此排版调整能作用到已下载的书)
-M.VERSION = 4
+M.VERSION = 5
 
 local BLOCK_TAGS = {
   p = true,
@@ -460,6 +460,12 @@ function M.convert(xhtml, opts)
   })
   local images = {}
   local styles = {}
+  -- Heading lines are recorded so the reader can paint them itself: syntax
+  -- highlighters give headings their own colour *and* background, which breaks
+  -- the illusion of a paper page.
+  -- (记录标题行，让阅读器自己上色：语法高亮给标题配了各自的颜色**和背景**，会破坏
+  --  纸页的观感)
+  local headings = {}
   local rune = 0
   local pos = 1
   -- The book stylesheet plus the chapter's own <style> block; the chapter wins,
@@ -600,6 +606,7 @@ function M.convert(xhtml, opts)
         in_heading = true
         local level = math.min(6, math.max(1, HEADINGS[tag_name] + heading_offset))
         buffer:block_marker(string.rep("#", level) .. " ")
+        headings[#headings + 1] = { line = #buffer.lines, level = level }
       end
     elseif tag_name == "li" then
       buffer:separate()
@@ -753,6 +760,7 @@ function M.convert(xhtml, opts)
     map = map,
     source_runes = rune,
     images = images,
+    headings = headings,
     -- Display-only styling: markdown cannot express underline, strike, marks
     -- or superscript, so those come back as positions the reader draws with
     -- extmarks. Bold/italic are also listed, so the reader can hide the `**`
