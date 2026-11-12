@@ -1,0 +1,244 @@
+*weread.txt*  在 Neovim 里读微信读书
+
+==============================================================================
+CONTENTS                                                      *weread-contents*
+
+  1. Introduction ........................ |weread-introduction|
+  2. Setup ............................... |weread-setup|
+  3. Commands ............................ |weread-commands|
+  4. Health check ........................ |weread-health|
+
+==============================================================================
+1. Introduction                                           *weread-introduction*
+
+weread.nvim reads WeRead (微信读书) inside Neovim (>= 0.10). Pure Lua, no build
+step. It needs `curl`; `qrencode` (QR login) and `snacks.nvim` (images) are
+optional.
+
+This file only lists the commands. Configuration, key mappings, themes, layout
+and the data layout are documented in the README of the repository.
+
+==============================================================================
+2. Setup                                                          *weread-setup*
+>lua
+    require("weread").setup({
+      layout = { page_chars = 26 },
+    })
+<
+`setup()` is optional: the commands call it with the defaults when needed.
+Unknown keys and values of the wrong type are reported once and ignored. See
+the "配置" section of the README for every option and its default.
+
+==============================================================================
+3. Commands                                                    *weread-commands*
+
+                                                                  *:WeReadLogin*
+:WeReadLogin[!]         Log in by scanning a QR code. With [!] the old
+                        credentials are cleared first.
+
+                                                                 *:WeReadLogout*
+:WeReadLogout           Log out and clear the local credentials.
+
+                                                                       *:WeRead*
+:WeRead [keyword]       Bookshelf picker; with a keyword, search the store.
+
+                                                                 *:WeReadSearch*
+:WeReadSearch {keyword} Search the store.
+
+                                                                   *:WeReadOpen*
+:WeReadOpen [query]     Open a book by bookId, title or URL. Without an
+                        argument, resume the last one.
+
+                                                                 *:WeReadResume*
+:WeReadResume           Continue where you stopped.
+
+                                                                    *:WeReadToc*
+:WeReadToc              Table of contents picker.
+
+                                                                  *:WeReadStats*
+:WeReadStats [week|month|year|all]
+                        Reading statistics.
+
+                                                                   *:WeReadHide*
+:WeReadHide             Hide the book (boss key); run again to come back.
+
+                                                              *:WeReadBookmark*
+:WeReadBookmark         Add or remove a bookmark on the cursor line.
+                                                             *:WeReadBookmarks*
+:WeReadBookmarks        Bookmark list.
+
+                                                                   *:WeReadFind*
+:WeReadFind [keyword]   Search the chapters downloaded so far.
+
+                                                                 *:WeReadExport*
+:WeReadExport [qf|path] Export the highlights and thoughts of this book.
+
+                                                         *:WeReadNext* *:WeReadPrev*
+:WeReadNext             Next chapter.
+:WeReadPrev             Previous chapter.
+
+                                                                *:WeReadChapter*
+:WeReadChapter {n}      Go to the n-th readable chapter.
+
+                                                                *:WeReadRefresh*
+:WeReadRefresh          Fetch the current chapter again.
+
+                                                                   *:WeReadSync*
+:WeReadSync             Upload the reading progress now.
+
+                                                            *:WeReadAnnotations*
+:WeReadAnnotations[!]   Highlights and thoughts of this chapter; [!] fetches
+                        them again.
+
+                                                             *:WeReadHighlight*
+:[range]WeReadHighlight Highlight the cursor line, or the given lines.
+                                                           *:WeReadUnhighlight*
+:[range]WeReadUnhighlight[!]
+                        Remove highlights made here on the cursor line or the
+                        given lines. With [!] clear all of them in the chapter.
+
+                                                                  *:WeReadNote*
+:WeReadNote [text]      Write a thought under the highlight at the cursor;
+                        without text, open an input box.
+                                                            *:WeReadDeleteNote*
+:WeReadDeleteNote       Delete my thought under the highlight at the cursor.
+
+                                                                  *:WeReadEpub*
+:WeReadEpub [bilingual] [cached] [model] [path]
+                        Write the whole open book as an EPUB with the LLM's
+                        translation. Chapters not downloaded are downloaded,
+                        chapters not translated by the book's model are
+                        translated, then the EPUB is written. By default each
+                        translated block of the original is replaced by its
+                        translation, `bilingual` puts it under the original,
+                        `cached` uses what is already here, `status` reports
+                        progress, `stop` ends an export under way. The EPUB is
+                        then put on the account's shelf with the logged-in
+                        session (the web 传书 endpoints); `local` skips that,
+                        `upload` only uploads the last export.
+                        Every illustration of the book is downloaded first
+                        (reading only fetches the ones of pages on screen)
+                        and kept in its place; one that cannot be had leaves
+                        its caption, and the report counts them.
+                        The cover comes from the book info (the official
+                        API, then the web one); when there is none the
+                        report says why. Contents entries use the translated
+                        titles, taken from the translated headings when the
+                        catalog has no Chinese title; split files named after
+                        the book are folded into their chapter.
+                        Turning translation off on a page, or opening
+                        another book, does not cancel an export's
+                        translations. A chapter with no request started and
+                        no reply for three times `BATCH_TIMEOUT` (90 s) is
+                        given up and logged, and the export goes on. `stop`
+                        always ends the export and clears it.
+
+                        Every request to the LLM, from `K`, the 译文 key and
+                        exports alike, waits for a slot of one gate:
+                        `lookup.llm.max_concurrency` (4) in flight at most,
+                        `K` ahead of the batches.
+
+                                                             *:WeReadTranslate*
+:WeReadTranslate [on|off|only]
+                        Translate the chapter (also `<leader>wy`); without an
+                        argument, toggle. Turning it on asks who translates:
+                        a model of `lookup.chapter_models` (by default
+                        `claude-opus-5-5` and `deepseek-v4-flash` on the
+                        Claude Code gateway) or WeRead's own translation. The
+                        pick is remembered per book. A model translates
+                        paragraph by paragraph, starting where the
+                        cursor is, and the page fills in as batches arrive.
+                        When it fails, WeRead's own translation is used
+                        instead. `lookup.chapter = "weread"` uses WeRead's
+                        only. Translations are kept in `chapters/NNNN.llm.json`.
+                        `:WeReadTranslate only` (also `<leader>wY`) shows the
+                        translation alone: the lines of the original that
+                        have a translation under them are hidden, not removed,
+                        so highlights and progress still use the original.
+                        Press it again to turn the translation off.
+
+                                                                 *:WeReadTheme*
+:WeReadTheme[!] [name | auto | none | next | prev | global]
+                        Reading theme. Without an argument a picker opens:
+                        moving through it tries each theme on the open
+                        chapters, <CR> keeps one, <Esc> puts the old one
+                        back. `next` and `prev` step from the lightest
+                        palette to the darkest (`]t` / `[t` in a chapter).
+                        `auto` follows 'background'. With [!] the choice is
+                        for the open book only; `global` makes the book
+                        follow the global theme again.
+
+                                                                  *:WeReadZone*
+:WeReadZone [rain | life | fire]
+                        Play with the page on screen: the letters fall like
+                        rain, turn into a game of life, or a pixel fireplace
+                        burns over them. Any key brings the page back.
+
+                                                               *:WeReadSprites*
+:WeReadSprites          Play every pixel sprite once, one after another, in
+                        the middle of the page.
+
+                                                                *:WeReadTrophy*
+:WeReadTrophy           The card for the open book: title, the days it was
+                        read here, highlights, and one of your own lines.
+                        `s` saves it as Markdown.
+
+                                                                  *:WeReadDict*
+:WeReadDict [status | install [{url}] | build {csv}]
+                        The offline English-Chinese dictionary (ECDICT).
+                        `install` downloads it (about 66 MB) and imports it
+                        into SQLite with `sqlite3`; `build` imports a CSV you
+                        already have; `status` says whether it is ready.
+
+                                                                 *:WeReadWidth*
+:WeReadWidth [{chars}|+|-]
+                        Characters per line. Without an argument, show it;
+                        `+`/`-` step by two, a number sets it (12-60). The
+                        chapter is laid out again around the cursor. In a
+                        chapter buffer `+` and `-` do the same.
+
+                                                                  *:WeReadFont*
+:WeReadFont             Open reading-font picker. The selected local font
+                        applies immediately in the current chapter. A WeRead
+                        font downloads once, then applies automatically.
+                        The first picker item follows the terminal font.
+                        kitty remote control is enabled automatically when
+                        needed; outside a controllable kitty terminal, the
+                        choice is saved but cannot apply immediately.
+
+                                                                   *:WeReadLog*
+:WeReadLog              Show the run log.
+
+                                                                  *weread-K*
+K                       On an English word: translate it in a popup next to
+                        the cursor. On a highlight: choose between translating
+                        and reading its thoughts. On a footnote mark: the
+                        footnote. In visual mode: translate the selection.
+                        `K` again enters the popup, `q` closes it.
+
+                        One translation is shown. Words go to the
+                        dictionaries in `lookup.word` (default: local ECDICT,
+                        then Youdao online). Phrases and sentences go to the
+                        LLM: the gateway Claude Code uses
+                        (`$ANTHROPIC_BASE_URL` and `$ANTHROPIC_AUTH_TOKEN`,
+                        else the `env` block of `~/.claude/settings.json`)
+                        with `deepseek-v4-flash`; the popup says it is
+                        waiting meanwhile. When the LLM fails or takes longer
+                        than `lookup.llm.timeout` (8 s), Tencent TranSmart
+                        answers instead and the popup marks it as the
+                        fallback. Set `lookup.llm.base_url`, `model` and
+                        `api_key_env` for another OpenAI-compatible service,
+                        or `lookup.sentence = { "transmart" }` for the fast
+                        translator alone. Results other than fallbacks
+                        are cached in `data_dir/lookup.json`.
+
+==============================================================================
+4. Health check                                                   *weread-health*
+
+>vim
+    :checkhealth weread
+<
+Checks curl and the other tools, terminal image support, the data directory
+and the credentials.
+
+ vim:tw=78:ts=8:ft=help:norl:

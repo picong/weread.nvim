@@ -1,4 +1,5 @@
 *.log
 *.tmp
-.doc/
 luacov.*
+scripts/__pycache__/
+doc/tags
