@@ -14,569 +14,304 @@ Buffer model
   costs one reader-page request, four shard requests and one tarball.
   (已缓存的章节只需一次文件读取；新章节需要一次阅读器页面请求、四次分片请求和
    一次资源包下载)
+
+Layout of the reader
+(阅读器的分工)
+
+This file is the facade the rest of the plugin (and the specs) talk to: opening
+books and chapters, following another device, hiding, the pickers. The work it
+used to do itself lives next door:
+
+* `session`          state, catalog helpers, offset maps, the position record
+* `chapter_pipeline` catalog entry -> rendered chapter on disk
+* `reader_window`    chapter -> buffer and window
+* `reader_keymaps`   keys and footnotes
+* `reader_translate` full-text translation
+* `reader_autocmds`  position memory, resize, the reading shell
+
+Every public name stays here, re-exported, so callers did not have to change.
+`reader.state` is `session.state` itself, not a copy.
+(本文件是插件其余部分（以及 spec）对话的外壳：打开书与章节、跟随其它设备、速隐、选择器。
+ 以前它自己做的事现在放在隔壁的模块里。每个公开名字都还在这里，以再导出的方式保留，调用方
+ 不必改动。`reader.state` 就是 `session.state` 本身，不是副本)
 ]]
 
 local cache = require("weread.cache")
+local chapter_pipeline = require("weread.chapter_pipeline")
 local config = require("weread.config")
 local content = require("weread.content")
+local layout = require("weread.layout")
 local log = require("weread.log")
 local P = require("weread.protocol")
+local reader_autocmds = require("weread.reader_autocmds")
+local reader_keymaps = require("weread.reader_keymaps")
+local reader_translate = require("weread.reader_translate")
+local reader_window = require("weread.reader_window")
+local session = require("weread.session")
 local ui = require("weread.ui")
-local xhtml = require("weread.xhtml")
 
 local M = {}
 
-local state = {
-  book = nil, -- { book_id, title, author, psvts, pclts, token }
-  catalog = nil, -- { chapters = {...} }
-  index = 0,
-  inflight = {},
-}
+local state = session.state
+
+-- ------------------------------------------------------------------ re-exports
 
 M.state = state
 
-local function keymaps_enabled()
-  return config.get().keymaps ~= false
+M.is_readable = session.is_readable
+M.readable_indices = session.readable_indices
+M.next_readable = session.next_readable
+M.prev_readable = session.prev_readable
+M.position_of = session.position_of
+
+M.source_offset = session.source_offset
+M.line_source = session.line_source
+M.line_of_source = session.line_of_source
+M.footnotes = session.footnotes
+M.buffer_info = session.buffer_info
+M.current = session.current
+M.find_chapter_buffer = session.find_chapter_buffer
+M.page_width = session.page_width
+M.set_page_width = session.set_page_width
+
+M.show_footnote = reader_keymaps.show_footnote
+M.jump_footnote = reader_keymaps.jump_footnote
+M.hover = reader_keymaps.hover
+M.claim_hover = reader_keymaps.claim_hover
+M.install_keymaps = reader_keymaps.install_keymaps
+
+M.prefetch = chapter_pipeline.prefetch
+M.auto_translate = reader_translate.auto_translate
+M.toggle_translation = reader_translate.toggle_translation
+M.toggle_translation_only = reader_translate.toggle_translation_only
+M.resized_split = reader_autocmds.resized_split
+
+-- ------------------------------------------------------------------ scrolling
+
+---Lines one wheel notch scrolls, from `layout.mousescroll`.
+---(滚轮一格滚动几行，取自 layout.mousescroll)
+---
+---The config always carries a value (its defaults are merged in), so there is
+---no second default spelled out here.
+---(配置里一定有这个值（默认值已合并进去），所以这里不再写第二份默认)
+---@return integer
+function M.wheel_lines()
+  local spec = tostring((config.get().layout or {}).mousescroll)
+  return math.max(1, tonumber(spec:match("ver%s*:%s*(%d+)")) or 1)
 end
 
----A chapter is readable when it carries text. WeRead lists cover and divider
----entries with `wordCount = 0`.
----(wordCount 为 0 的是封面/分页条目，不参与阅读)
----@param chapter table
----@return boolean
-function M.is_readable(chapter)
-  local words = tonumber(chapter.wordCount)
-  if words == nil then
+---Run a scroll motion, and turn the page when it could not move.
+---(执行一次滚动动作；动不了就翻页)
+---
+---The movement test is what tells a page edge from an ordinary scroll: the
+---cursor and the top line are both checked, so motions that move only the view
+---(`<C-e>`) or only the cursor (`gj`) are recognised as movement.
+---(「有没有动」是区分页边与普通滚动的依据：光标与首行都检查，因此只移视图（`<C-e>`）
+--- 或只移光标（`gj`）都算动过)
+---@param key string motion to run when it can move(能移动时执行的动作)
+---@param forward boolean
+---@param count integer|nil defaults to the count the key was pressed with
+---@return boolean moved_or_turned
+function M.scroll_or_turn(key, forward, count)
+  count = math.max(1, tonumber(count) or tonumber(vim.v.count1) or 1)
+  local before_line, before_top = vim.fn.line("."), vim.fn.line("w0")
+  if key == "gj" or key == "gk" then
+    -- past lines that take no rows (hidden originals, wrapped table rows)
+    -- (跨过不占屏行的行：藏起的原文、折行的表格行)
+    require("weread.pager").step(vim.api.nvim_get_current_win(), key == "gj", count)
+  else
+    vim.cmd("normal! " .. tostring(count) .. key)
+  end
+  local moved = vim.fn.line(".") ~= before_line or vim.fn.line("w0") ~= before_top
+  if moved then
     return true
   end
-  return words > 0
-end
-
----@return integer[] indices of readable chapters
-function M.readable_indices()
-  local indices = {}
-  for index, chapter in ipairs((state.catalog or {}).chapters or {}) do
-    if M.is_readable(chapter) then
-      indices[#indices + 1] = index
-    end
-  end
-  return indices
-end
-
----@param index integer
----@return integer next readable index, or the same index when there is none
-function M.next_readable(index)
-  local chapters = (state.catalog or {}).chapters or {}
-  for candidate = index + 1, #chapters do
-    if M.is_readable(chapters[candidate]) then
-      return candidate
-    end
-  end
-  return index
-end
-
----@param index integer
----@return integer
-function M.prev_readable(index)
-  for candidate = index - 1, 1, -1 do
-    if M.is_readable((state.catalog or {}).chapters[candidate]) then
-      return candidate
-    end
-  end
-  return index
-end
-
----@param index integer
----@return integer position among readable chapters (1-based)
----@return integer total readable chapters
-function M.position_of(index)
-  local indices = M.readable_indices()
-  for position, candidate in ipairs(indices) do
-    if candidate == index then
-      return position, #indices
-    end
-  end
-  return 1, math.max(1, #indices)
-end
-
--- ------------------------------------------------------------------ buffers
-
----Persist the reading position. Assigned further down; declared here because
----opening a chapter has to record its own position (see display_chapter).
----(保存阅读位置。定义在下方，此处先声明：打开章节时需要立刻记录目标位置)
-local save_position
-
----@param buf integer
----@return table|nil
-function M.buffer_info(buf)
-  buf = buf or vim.api.nvim_get_current_buf()
-  local ok, info = pcall(vim.api.nvim_buf_get_var, buf, "weread")
-  if not ok or type(info) ~= "table" then
-    return nil
-  end
-  return info
-end
-
----@return table|nil
-function M.current()
-  local info = M.buffer_info()
-  if not info or not state.book or state.book.book_id ~= info.book_id then
-    return nil
-  end
-  return state
-end
-
----@param book_id string
----@return integer|nil
-function M.find_chapter_buffer(book_id, chapter_key)
-  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-    local info = M.buffer_info(buf)
-    if info and info.book_id == book_id and info.chapter_key == chapter_key then
-      return buf
-    end
-  end
-  return nil
-end
-
-local function set_winbar(win, book, chapter, index, total)
-  if not vim.api.nvim_win_is_valid(win) then
-    return
-  end
-  local position = select(1, M.position_of(index))
-  local readable_total = total
-  local title = string.format(
-    " %s · %s  %d/%d  ]c 下一章  <leader>wt 目录 ",
-    book.title or "微信读书",
-    chapter.title or "",
-    position,
-    readable_total
-  )
-  vim.wo[win].winbar = title
-end
-
----@param buf integer
----@param book table
----@param chapter table
----@param index integer
----@param path string
-local function setup_chapter_buffer(buf, book, chapter, index, path)
-  vim.bo[buf].buftype = ""
-  vim.bo[buf].swapfile = false
-  vim.bo[buf].filetype = "markdown"
-  vim.bo[buf].modifiable = false
-  vim.bo[buf].modified = false
-
-  vim.b[buf].weread = {
-    book_id = book.book_id,
-    chapter_uid = tostring(chapter.chapterUid),
-    chapter_index = index,
-    chapter_key = cache.chapter_key(chapter),
-    title = book.title,
-    chapter_title = chapter.title,
-    path = path,
-  }
-
-  if keymaps_enabled() then
-    local function map(lhs, rhs, desc)
-      vim.keymap.set("n", lhs, rhs, { buffer = buf, silent = true, nowait = true, desc = desc })
-    end
-    map("]c", function()
-      M.next_chapter()
-    end, "微信读书：下一章")
-    map("[c", function()
-      M.prev_chapter()
-    end, "微信读书：上一章")
-    map("<leader>wt", function()
-      M.toc()
-    end, "微信读书：目录")
-    map("<leader>wr", function()
-      M.reload()
-    end, "微信读书：重新抓取本章")
-    map("<leader>wo", function()
-      local ok, image = pcall(require, "weread.image")
-      if ok then
-        image.hover_at_cursor()
-      else
-        vim.notify("weread: 图片模块未加载", vim.log.levels.WARN)
-      end
-    end, "微信读书：放大查看插图")
-    map("K", function()
-      local ok, annotations = pcall(require, "weread.annotations")
-      if ok and annotations.show_thoughts_at_cursor then
-        annotations.show_thoughts_at_cursor()
-      else
-        vim.notify("weread: 划线模块未加载", vim.log.levels.WARN)
-      end
-    end, "微信读书：查看该处想法")
-    map("<leader>wa", function()
-      local ok, annotations = pcall(require, "weread.annotations")
-      if ok and annotations.show_chapter_summary then
-        annotations.show_chapter_summary()
-      end
-    end, "微信读书：本章划线与想法")
-    map("<leader>ws", function()
-      local ok, progress = pcall(require, "weread.progress")
-      if ok then
-        progress.sync_now()
-      end
-    end, "微信读书：立即回传进度")
-  end
-end
-
----Apply reading-friendly window options.
----(应用适合阅读的窗口选项)
----@param win integer
-local function setup_window(win)
-  vim.wo[win].number = false
-  vim.wo[win].relativenumber = false
-  vim.wo[win].signcolumn = "no"
-  vim.wo[win].foldcolumn = "0"
-  vim.wo[win].wrap = true
-  vim.wo[win].linebreak = true
-  vim.wo[win].breakindent = true
-  vim.wo[win].list = false
-  vim.wo[win].spell = false
-  local opts = config.get()
-  -- A highlighted line across a wrapped Chinese paragraph is heavy; the winbar
-  -- plus the line number already tell you where you are.
-  -- (整行高亮压在折行的中文段落上很重；位置由 winbar 与行号就能看出来)
-  vim.wo[win].cursorline = opts.cursorline == true
-  vim.wo[win].cursorlineopt = "both"
-  vim.wo[win].conceallevel = 2
-  vim.wo[win].concealcursor = "n"
-  -- Off by default: a colorcolumn line running through the text is the opposite
-  -- of a book page.
-  -- (默认关闭：一条穿过正文的竖线和书页的观感相反)
-  local width = tonumber(opts.text_width) or 0
-  vim.wo[win].colorcolumn = (width > 0 and width < vim.o.columns) and tostring(width) or ""
-end
-
----Show a chapter buffer.
----@param book table
----@param chapter table
----@param index integer
----@param opts table|nil { line = integer }
-local function display_chapter(book, chapter, index, opts)
-  opts = opts or {}
-  local path = cache.chapter_file(book.book_id, chapter, "md")
-
-  local buf = M.find_chapter_buffer(book.book_id, cache.chapter_key(chapter))
-  local reuse = buf ~= nil and vim.api.nvim_buf_is_valid(buf)
-
-  if reuse then
-    vim.api.nvim_win_set_buf(0, buf)
-  else
-    buf = vim.fn.bufadd(path)
-    vim.bo[buf].buflisted = true
-    vim.fn.bufload(buf)
-    vim.api.nvim_win_set_buf(0, buf)
-    setup_chapter_buffer(buf, book, chapter, index, path)
-  end
-
-  local win = vim.api.nvim_get_current_win()
-  setup_window(win)
-  -- repaint this window in the reading palette (chapter only, editor untouched)
-  -- (把该窗口刷成阅读配色：只影响章节窗口，编辑器不受影响)
-  pcall(function()
-    require("weread.theme").apply(win)
-  end)
-  local _, total = M.position_of(index)
-  set_winbar(win, book, chapter, index, total)
-
-  state.index = index
-  vim.b[buf].weread_positions = { index = index }
-
-  local target = tonumber(opts.line)
-  if opts.resume then
-    local saved = cache.read_position(book.book_id)
-    if saved and tostring(saved.chapter_key) == cache.chapter_key(chapter) then
-      target = tonumber(saved.line)
-    end
-  end
-  if target and target > 0 then
-    local last = vim.api.nvim_buf_line_count(buf)
-    vim.api.nvim_win_set_cursor(win, { math.min(target, last), 0 })
-    vim.cmd("normal! zz")
-  end
-
-  -- Record the destination right away. `nvim_win_set_buf` above already fired
-  -- BufLeave for the chapter being left, and a book keeps a single position
-  -- record — last writer wins. Without this line, switching chapters stores the
-  -- *previous* chapter, which is exactly the "it forgot where I was" symptom.
-  -- (立刻记录目标章节：上面的 nvim_win_set_buf 已经为离开的章节触发过 BufLeave，
-  --  而每本书只存一条位置记录，后写者胜。少了这一行，切章后留下的是上一章，
-  --  正是「记不住我读到哪」的成因)
-  if save_position then
-    save_position()
-  end
-
-  local ok, annotations = pcall(require, "weread.annotations")
-  if ok and annotations.attach then
-    annotations.attach(buf)
-  end
-
-  local ok_image, image = pcall(require, "weread.image")
-  if ok_image and image.attach then
-    image.attach(buf)
-  end
-
-  -- emphasis comes back as real bold/italic instead of visible `**`
-  -- (强调以真正的粗体/斜体呈现，而不是把 `**` 摆在读者眼前)
-  local ok_inline, inline = pcall(require, "weread.inline")
-  if ok_inline and inline.attach then
-    local meta = cache.read_json(cache.chapter_file(book.book_id, chapter, "map.json"))
-    inline.attach(buf, inline.from_meta(meta), meta and meta.headings)
-  end
-
-  local ok_progress, progress = pcall(require, "weread.progress")
-  if ok_progress then
-    progress.enter(require("weread.reader"))
-  end
-end
-
--- ------------------------------------------------------------------ fetching
-
----Resolve a cached image id to its file on disk, if it is there.
----(把缓存的图片 id 解析成磁盘文件)
----@param book_id string
----@param src string
----@return string|nil
-local function cached_image_path(book_id, src)
-  local id = content.image_id(src)
-  local matches = vim.fn.glob(cache.assets_dir(book_id) .. "/" .. id .. ".*", false, true)
-  return matches[1]
-end
-
----Render a chapter from the cached source XHTML, without the network.
----(用缓存的源 XHTML 本地重排一章，不联网)
----@param book_id string
----@param chapter table
----@return boolean ok
----@return string|nil err
-local function render_from_cache(book_id, chapter)
-  local source = cache.read(cache.chapter_file(book_id, chapter, "xhtml"))
-  if not source or source == "" then
-    return false, "no cached source"
-  end
-  local converted = xhtml.convert(source, {
-    resolve_image = function(src)
-      return cached_image_path(book_id, src)
-    end,
-    -- the book stylesheet is what turns `<span class="...">` back into bold
-    -- (书里的样式表正是让 `<span class="...">` 恢复加粗的依据)
-    css = cache.read(cache.chapter_file(book_id, chapter, "css")),
-    skip_title = xhtml.repeats_title(source, chapter.title),
-    gap = (config.get().paragraph or {}).gap,
-  })
-  cache.write(cache.chapter_file(book_id, chapter, "md"), converted.text)
-  cache.write_json(cache.chapter_file(book_id, chapter, "map.json"), {
-    map = converted.map,
-    source_runes = converted.source_runes,
-    images = converted.images,
-    styles = converted.styles,
-    headings = converted.headings,
-    renderer = xhtml.VERSION,
-  })
-  return true, nil
-end
-
----Is the cached chapter rendered by the current renderer?
----(缓存章节是否由当前渲染器产出)
----@param book_id string
----@param chapter table
----@return boolean
-local function chapter_cache_is_fresh(book_id, chapter)
-  local md = cache.chapter_file(book_id, chapter, "md")
-  if vim.fn.filereadable(md) ~= 1 then
+  if not M.auto_next() then
     return false
   end
-  local meta = cache.read_json(cache.chapter_file(book_id, chapter, "map.json"))
-  return meta ~= nil and meta.renderer == xhtml.VERSION
+  return M.turn(forward)
 end
 
----@param book table
----@param chapter table
----@param callback fun(ok: boolean, result: string|nil)
-local function ensure_chapter_cached(book, chapter, callback)
-  if chapter_cache_is_fresh(book.book_id, chapter) then
-    callback(true, nil)
-    return
+---The mouse wheel: scroll a few screen lines, and turn the page when the wheel
+---keeps turning at either end.
+---(鼠标滚轮：滚动几行；在两端继续滚就翻页)
+---
+---Scrolling is judged by what is *visible*, not by whether the cursor moved:
+---`<C-e>` can keep scrolling past the last line, filling the window with empty
+---space that no reader asked for. Once the end of the chapter is on screen,
+---another notch down is a request for the next chapter.
+---(滚动按「屏幕上还能不能露出新内容」判断，而不是看光标有没有动：`<C-e>` 可以一直滚过
+--- 最后一行，把窗口填满没人要的空白。章末已经在屏幕上之后，再往下一格就是要下一章)
+---@param forward boolean
+---@param count integer|nil
+---@return boolean
+function M.wheel_or_turn(forward, count)
+  count = math.max(1, tonumber(count) or M.wheel_lines())
+  if forward and vim.fn.line("w$") >= vim.api.nvim_buf_line_count(0) and M.auto_next() then
+    return M.turn(true)
   end
-
-  -- The source XHTML is cached: re-render locally rather than re-downloading.
-  -- This is what makes a typography change reach books that are already
-  -- downloaded.
-  -- (源 XHTML 已缓存，直接本地重排而不是重新下载——这正是让排版调整作用到已下载
-  --  书籍的关键)
-  local rendered, render_err = render_from_cache(book.book_id, chapter)
-  if rendered then
-    log.debug("re-rendered chapter %s from cache", chapter.title)
-    callback(true, nil)
-    return
+  if not forward and vim.fn.line("w0") <= 1 and M.auto_next() then
+    return M.turn(false)
   end
-  log.debug("cache unusable for %s (%s); fetching", tostring(chapter.title), tostring(render_err))
-
-  local key = tostring(book.book_id) .. ":" .. cache.chapter_key(chapter)
-  if state.inflight[key] then
-    table.insert(state.inflight[key], callback)
-    return
-  end
-  state.inflight[key] = { callback }
-
-  local function finish(ok, result)
-    local waiters = state.inflight[key] or {}
-    state.inflight[key] = nil
-    for _, waiter in ipairs(waiters) do
-      waiter(ok, result)
-    end
-  end
-
-  local function fail(message)
-    log.warn("chapter fetch failed for %s/%s: %s", book.book_id, chapter.title, tostring(message))
-    finish(false, message)
-  end
-
-  -- 1) fresh reader state; psvts is re-issued per chapter
-  -- (每章重新取一次 psvts)
-  content.fetch_reader_state(book.book_id, chapter.chapterUid, function(ok, reader_state)
-    if not ok then
-      fail(reader_state)
-      return
-    end
-    book.psvts = reader_state.psvts
-    book.pclts = reader_state.pclts
-    book.token = reader_state.token
-    if reader_state.title and reader_state.title ~= "" then
-      book.title = reader_state.title
-    end
-
-    local shard_book = {
-      book_id = book.book_id,
-      chapter_uid = tostring(chapter.chapterUid),
-      psvts = reader_state.psvts,
-    }
-
-    -- 2) decode the chapter body
-    content.fetch_chapter(shard_book, function(chapter_ok, result)
-      if not chapter_ok then
-        fail(result)
-        return
-      end
-
-      -- 3) images; a failure here must not lose the text
-      -- (图片失败不能连正文一起丢)
-      content.fetch_assets(shard_book, chapter, function(assets_ok, assets)
-        local id_to_path = {}
-        if assets_ok and assets and assets.images then
-          cache.ensure_book_dirs(book.book_id)
-          for _, image in ipairs(assets.images) do
-            local path = cache.assets_dir(book.book_id) .. "/" .. image.id .. "." .. image.ext
-            local wrote = cache.write(path, image.data)
-            if wrote then
-              id_to_path[image.id] = path
-            end
-          end
-        elseif not assets_ok then
-          log.warn("asset fetch failed for %s: %s", chapter.title, tostring(assets))
-          vim.notify("weread: 本章图片下载失败，正文仍可阅读", vim.log.levels.WARN)
-        end
-
-        local converted = xhtml.convert(result.xhtml, {
-          resolve_image = function(src)
-            return id_to_path[content.image_id(src)]
-          end,
-          css = result.css,
-          skip_title = xhtml.repeats_title(result.xhtml, chapter.title),
-          gap = (config.get().paragraph or {}).gap,
-        })
-
-        cache.write(cache.chapter_file(book.book_id, chapter, "xhtml"), result.xhtml)
-        cache.write(cache.chapter_file(book.book_id, chapter, "md"), converted.text)
-        cache.write_json(cache.chapter_file(book.book_id, chapter, "map.json"), {
-          map = converted.map,
-          source_runes = converted.source_runes,
-          images = converted.images,
-          styles = converted.styles,
-          headings = converted.headings,
-          renderer = xhtml.VERSION,
-        })
-        if result.css then
-          cache.write(cache.chapter_file(book.book_id, chapter, "css"), result.css)
-        end
-
-        finish(true, nil)
-      end)
-    end)
-  end)
-end
-
----@param book table
----@param index integer
----@param callback fun(ok: boolean, result: string|nil)
-function M.prefetch(book, index, callback)
-  local chapter = ((state.catalog or {}).chapters or {})[index]
-  if not chapter or not M.is_readable(chapter) then
-    if callback then
-      callback(true, nil)
-    end
-    return
-  end
-  ensure_chapter_cached(book, chapter, function(ok, result)
-    if ok then
-      log.debug("prefetched chapter %s", chapter.title)
-    end
-    if callback then
-      callback(ok, result)
-    end
-  end)
+  return M.scroll_or_turn(forward and "\5" or "\25", forward, count)
 end
 
 -- ------------------------------------------------------------------ api
 
+---Remote position waiting for the reader to come back to the book.
+---(等读者回到书里再跳的远端位置)
+local pending_remote = nil
+
+---Tell the progress module that a remote jump will not land, so it stops
+---holding back this book's reports.
+---(告诉进度模块这次远端跳转落不了地，让它不再扣住这本书的上报)
+---@param remote table|nil
+local function release_remote(remote)
+  if not remote then
+    return
+  end
+  local ok_progress, progress = pcall(require, "weread.progress")
+  if ok_progress and progress.undefer then
+    progress.undefer(remote)
+  end
+end
+
+---Does the window still show the book a pending chapter belongs to?
+---(窗口里显示的还是不是这个待显示章节所属的书？)
+---@param win integer
+---@param book_id string
+---@return boolean
+local function window_shows_book(win, book_id)
+  local showing = vim.api.nvim_win_is_valid(win) and session.buffer_info(vim.api.nvim_win_get_buf(win))
+  return showing and tostring(showing.book_id) == tostring(book_id) or false
+end
+
 ---Open a chapter by catalog index.
+---(按目录序号打开一章)
+---
+---The window is fixed when the call is made: the chapter may have to be
+---downloaded first, and by the time it arrives "the current window" can be a
+---different one (or none: a picker that closed, a split that was dropped).
+---(窗口在调用的那一刻就定下来：章节可能要先下载，等它到了，「当前窗口」可能已经是另一个
+--- （甚至没有了：关掉的选择器、被关掉的分屏）)
+---The loading book playing over each window, so a second open replaces it.
+---(每个窗口上正在播放的加载书本，第二次打开会替换它)
+---@type table<integer, table>
+local loading_books = {}
+
 ---@param index integer
----@param opts table|nil { resume = boolean, refresh = boolean }
+---@param opts table|nil { resume = boolean, refresh = boolean, win = integer, remote = table }
 function M.open_index(index, opts)
   opts = opts or {}
-  local chapters = (state.catalog or {}).chapters or {}
-  local chapter = chapters[index]
+  -- A session that never went through load_book (a restored buffer, a command
+  -- run in a fresh editor) still needs a page width before anything is rendered.
+  -- (没走过 load_book 的情况——恢复的 buffer、在新编辑器里直接跑命令——在渲染之前
+  --  同样需要先定下版心宽度)
+  if not session.page_width() then
+    session.set_page_width(layout.page_width(vim.api.nvim_get_current_win()))
+  end
+  local chapter = session.chapters()[index]
   if not chapter then
     vim.notify("weread: 章节不存在", vim.log.levels.WARN)
     return
   end
-  if not M.is_readable(chapter) then
+  if not session.is_readable(chapter) then
     vim.notify("weread: 该条目没有正文（多为封面或分页）", vim.log.levels.WARN)
     return
   end
 
+  local book = state.book
+  local win = opts.win or vim.api.nvim_get_current_win()
+  if not book or not vim.api.nvim_win_is_valid(win) then
+    release_remote(opts.remote)
+    return
+  end
+  local origin_buf = vim.api.nvim_win_get_buf(win)
+  -- Window-local generations let only the latest choice display its result.
+  -- (窗口局部代次保证只有最后一次选择能显示结果)
+  local request = (vim.w[win].weread_request or 0) + 1
+  vim.w[win].weread_request = request
+  chapter_pipeline.cancel_prefetch()
+
   if opts.refresh then
-    local key = tostring(state.book.book_id) .. ":" .. cache.chapter_key(chapter)
-    for _, kind in ipairs({ "md", "map.json", "xhtml", "css" }) do
-      local path = cache.chapter_file(state.book.book_id, chapter, kind)
-      if vim.fn.filereadable(path) == 1 then
-        vim.uv.fs_unlink(path)
-      end
-    end
+    local key = tostring(book.book_id) .. ":" .. cache.chapter_key(chapter)
+    chapter_pipeline.drop_cache(book.book_id, chapter, { "md", "map.json", "xhtml", "trans.xhtml", "css" })
     state.inflight[key] = nil
   end
 
-  ensure_chapter_cached(state.book, chapter, function(ok, result)
-    if not ok then
-      vim.notify("weread: " .. tostring(result), vim.log.levels.ERROR)
+  -- A pixel book while the chapter is fetched. It waits a moment before showing,
+  -- so a chapter from the cache never flashes it.
+  -- (下载章节时的像素书本。它会先等一会儿再出现，所以缓存里的章节不会闪出它)
+  local fx = require("weread.fx")
+  fx.stop(loading_books[win])
+  local loading = require("weread.fx_effects").loading(win)
+  loading_books[win] = loading
+  local function stop_loading()
+    fx.stop(loading)
+    if loading_books[win] == loading then
+      loading_books[win] = nil
+    end
+  end
+  local called, call_err = pcall(chapter_pipeline.ensure_cached, book, chapter, function(ok, result)
+    stop_loading()
+    if not vim.api.nvim_win_is_valid(win) or vim.w[win].weread_request ~= request then
+      release_remote(opts.remote)
       return
     end
-    display_chapter(state.book, chapter, index, opts)
+    if not ok then
+      vim.notify("weread: " .. tostring(result), vim.log.levels.ERROR)
+      -- a jump that cannot land must not keep holding this book's reports
+      -- (落不了地的跳转，不能一直按住这本书的上报)
+      release_remote(opts.remote)
+      if opts.on_fail then
+        pcall(opts.on_fail, result)
+      end
+      return
+    end
+    -- The chapter is cached now. Whether it is also shown depends on what the
+    -- reader did meanwhile: another book, a window that is gone, a window that
+    -- moved on to something else. In each case the work is kept and the reader
+    -- is left alone.
+    -- (章节此刻已经缓存好了。要不要显示取决于读者这段时间做了什么：换了一本书、窗口没了、
+    --  窗口换成了别的东西。无论哪种，成果留着，读者的屏幕不去打扰)
+    local current = state.book
+    local same_book = current ~= nil and tostring(current.book_id) == tostring(book.book_id)
+    local usable = same_book and vim.api.nvim_win_get_buf(win) == origin_buf
+      and (not opts.win or window_shows_book(win, current.book_id))
+    if not usable then
+      -- wait for the reader to come back
+      -- (等读者回来)
+      if opts.remote then
+        pending_remote = opts.remote
+      end
+      return
+    end
+    vim.api.nvim_win_call(win, function()
+      reader_window.display_chapter(current, chapter, index, opts)
+    end)
+    if opts.remote then
+      local ok_progress, progress = pcall(require, "weread.progress")
+      if ok_progress and progress.adopted then
+        progress.adopted(opts.remote)
+      end
+    end
 
     local next_index = M.next_readable(index)
     if next_index ~= index then
-      vim.defer_fn(function()
-        M.prefetch(state.book, next_index)
-      end, 800)
+      chapter_pipeline.schedule_prefetch(current, next_index)
     end
+    -- the book's translation is on: this chapter is shown translated too
+    -- (这本书开着译文：这一章也以译文显示)
+    M.auto_translate(index)
   end)
+  if not called then
+    stop_loading()
+    error(call_err, 0)
+  end
 end
 
 ---Reload the chapter in the current buffer.
+---(重新抓取当前 buffer 里的章节)
 function M.reload()
   local info = M.buffer_info()
   if not info then
@@ -590,14 +325,49 @@ function M.next_chapter()
   local index = info and info.chapter_index or state.index
   local next_index = M.next_readable(index)
   if next_index == index then
-    vim.notify("weread: 已经是最后一章", vim.log.levels.INFO)
+    ui.notify("weread: 已经是最后一章", vim.log.levels.INFO, { routine = true })
     return
   end
-  local chapters = (state.catalog or {}).chapters or {}
-  if not chapters[next_index] then
+  if not session.chapters()[next_index] then
     return
   end
   M.open_index(next_index)
+end
+
+---Is walking past the end of a chapter supposed to turn the page?
+---(走到章末之外是否应该翻页)
+---@return boolean
+function M.auto_next()
+  return (config.get().layout or {}).auto_next ~= false
+end
+
+---Turn the page into the neighbouring chapter.
+---(翻页进入相邻章节)
+---
+---Forward opens the chapter at the top; backward opens it at the end, which is
+---where a reader arriving from the top of the next chapter wants to be.
+---(往后翻从章首开始；往前翻从章末开始——从下一章章首往回走的读者就在那里)
+---@param forward boolean
+---@return boolean turned
+function M.turn(forward)
+  local info = M.buffer_info()
+  local index = info and info.chapter_index or state.index
+  local target = forward and M.next_readable(index) or M.prev_readable(index)
+  if target == index then
+    -- the end of the book, or the very first chapter: stay where you are
+    -- (书的末尾或第一章：就停在这里)
+    -- The end of the book only when the catalog searched is this buffer's own:
+    -- with two books open, `state.catalog` is the one opened last.
+    -- (只有查找用的目录确实是这个 buffer 自己那本书的，才算读到书末：同时开着两本书时，
+    --  `state.catalog` 是最后打开的那本)
+    local own = info and state.book and tostring(info.book_id) == tostring(state.book.book_id)
+    if forward and own then
+      require("weread.fx").emit("WereadBookEnd", { book_id = info.book_id, index = index, chapters = #session.chapters() })
+    end
+    return false
+  end
+  M.open_index(target, { at_end = not forward })
+  return true
 end
 
 function M.prev_chapter()
@@ -605,7 +375,7 @@ function M.prev_chapter()
   local index = info and info.chapter_index or state.index
   local prev_index = M.prev_readable(index)
   if prev_index == index then
-    vim.notify("weread: 已经是第一章", vim.log.levels.INFO)
+    ui.notify("weread: 已经是第一章", vim.log.levels.INFO, { routine = true })
     return
   end
   M.open_index(prev_index)
@@ -623,45 +393,15 @@ function M.goto_readable_position(position)
 end
 
 ---Table of contents picker.
+---(目录选择器)
 function M.toc()
-  local chapters = (state.catalog or {}).chapters or {}
-  if #chapters == 0 then
-    vim.notify("weread: 目录为空", vim.log.levels.WARN)
-    return
-  end
-
-  local items = {}
-  local current = state.index
-  local indices = M.readable_indices()
-  local order = {}
-  for position, chapter_index in ipairs(indices) do
-    order[chapter_index] = position
-  end
-
-  for index, chapter in ipairs(chapters) do
-    if M.is_readable(chapter) then
-      local marker = index == current and "▶" or " "
-      items[#items + 1] = {
-        text = string.format("%s %s", marker, chapter.title or "(无标题)"),
-        index = index,
-        position = order[index],
-      }
-    end
-  end
-
-  ui.select({
-    title = string.format("%s · 目录（%d 章）", state.book and state.book.title or "微信读书", #items),
-    items = items,
-    format = "text",
-    on_choice = function(item)
-      M.open_index(item.index)
-    end,
-  })
+  require("weread.toc").open()
 end
 
 -- ------------------------------------------------------------------ loading
 
 ---Load a book's metadata and catalog, using the cache when possible.
+---(加载书的元数据与目录，尽量用缓存)
 ---@param book_id string|number
 ---@param opts table|nil { refresh = boolean }
 ---@param callback fun(ok: boolean, book: table|string)
@@ -675,6 +415,12 @@ function M.load_book(book_id, opts, callback)
 
   local meta = cache.read_meta(book_id)
   local catalog = cache.read_catalog(book_id)
+  -- The page width is decided once per session, from the window the chapter is
+  -- about to be shown in. Every chapter of the book is laid out for it, so one
+  -- reading session never mixes two page widths.
+  -- (版心宽度每个会话定一次，取自即将显示章节的那个窗口。整本书都按它排版，因此同一个
+  --  会话里读的书不会混用两种版心宽度)
+  session.set_page_width(layout.page_width(vim.api.nvim_get_current_win()))
   if meta and catalog and not opts.refresh and (catalog.chapters and #catalog.chapters > 0) then
     state.book = meta
     state.catalog = catalog
@@ -704,6 +450,7 @@ function M.load_book(book_id, opts, callback)
         token = reader_state.token,
         progress = (reader_state.progress or {}).progress,
         remote_chapter_uid = (reader_state.progress or {}).chapterUid,
+        translatable = reader_state.translatable,
         updated_at = os.time(),
       })
 
@@ -726,7 +473,7 @@ function M.start_index()
   if not book then
     return 1
   end
-  local chapters = (state.catalog or {}).chapters or {}
+  local chapters = session.chapters()
 
   local saved = cache.read_position(book.book_id)
   if saved and saved.chapter_key then
@@ -764,7 +511,7 @@ function M.saved_position(book_id)
   if not saved then
     return nil, nil
   end
-  local chapters = (state.catalog or {}).chapters or {}
+  local chapters = session.chapters()
   local chapter = chapters[tonumber(saved.chapter_index)]
   if not chapter or not M.is_readable(chapter) then
     -- The catalog may have changed under us; fall back to matching the key.
@@ -779,11 +526,59 @@ function M.saved_position(book_id)
   return tonumber(saved.chapter_index), chapter
 end
 
+---Open the chapter a reader picked in the shelf preview's contents.
+---(打开读者在书架预览目录里点中的那一章)
+---@param book_id string
+---@param chapter_uid string|number
+---@return boolean opened false when the catalog does not know the chapter(目录里没有这一章时为 false)
+local function open_picked_chapter(book_id, chapter_uid)
+  for index, chapter in ipairs(session.chapters()) do
+    if tostring(chapter.chapterUid) == tostring(chapter_uid) then
+      M.open_index(index, {})
+      return true
+    end
+  end
+  log.warn("chapter %s not in the catalog of %s; resuming instead", tostring(chapter_uid), book_id)
+  return false
+end
+
+---Where this machine says the book should resume, falling back to the service's
+---position when nothing was read here.
+---(本机认为这本书该从哪里续读；本机没读过时退到服务端报告的位置)
+---@param book_id string
+---@param book table
+---@return integer|nil index
+---@return table|nil chapter
+---@return boolean resuming
+local function resume_point(book_id, book)
+  local index, chapter = M.saved_position(book_id)
+  local resuming = index ~= nil
+
+  if not index and book.remote_chapter_uid then
+    -- Nothing read on this machine, but the service reports a position. That
+    -- only counts as history when it is actually *past* the opening chapter:
+    -- a book you have never opened still reports chapter 1.
+    -- (本机没读过，但服务端报告了位置。只有确实读过了才算历史——从未打开过的书
+    --  也会报告第一章)
+    -- readable_indices() returns an array: indexing it is not the same as
+    -- taking its first return value.
+    -- (readable_indices() 返回的是数组，取下标和取「第一个返回值」不是一回事)
+    local first_readable = M.readable_indices()[1] or 1
+    local remote_index = M.start_index()
+    if remote_index ~= first_readable then
+      index = remote_index
+      chapter = session.chapters()[index]
+      resuming = true
+    end
+  end
+  return index, chapter, resuming
+end
+
 ---Open a book. Resumes where the reader left off, and only shows the table of
 ---contents when there is nothing to resume (or when asked explicitly).
 ---(打开一本书：优先续读到上次位置；只有没得续或明确要求时才显示目录)
 ---@param book_id string|number
----@param opts table|nil { toc = boolean, refresh = boolean, index = integer }
+---@param opts table|nil { toc = boolean, refresh = boolean, chapter_uid = string|number }
 function M.open_book(book_id, opts)
   opts = opts or {}
   book_id = tostring(book_id)
@@ -798,48 +593,166 @@ function M.open_book(book_id, opts)
       return
     end
 
-    local index, chapter = M.saved_position(book_id)
-    local resuming = index ~= nil
-
-    if not index and book.remote_chapter_uid then
-      -- Nothing read on this machine, but the service reports a position. That
-      -- only counts as history when it is actually *past* the opening chapter:
-      -- a book you have never opened still reports chapter 1.
-      -- (本机没读过，但服务端报告了位置。只有确实读过了才算历史——从未打开过的书
-      --  也会报告第一章)
-      -- readable_indices() returns an array: indexing it is not the same as
-      -- taking its first return value.
-      -- (readable_indices() 返回的是数组，取下标和取「第一个返回值」不是一回事)
-      local first_readable = M.readable_indices()[1] or 1
-      local remote_index = M.start_index()
-      if remote_index ~= first_readable then
-        index = remote_index
-        chapter = ((state.catalog or {}).chapters or {})[index]
-        resuming = true
-      end
-    end
-
-    if not resuming then
-      vim.notify(
-        string.format("weread: 《%s》还没有阅读记录，先看目录", book.title or "?"),
-        vim.log.levels.INFO
-      )
-      M.toc()
+    -- A chapter picked from the shelf preview's TOC: the reader said where to
+    -- go, so neither the local record nor the service gets a say.
+    -- (从书架预览目录里点的章节：读者已经说了去哪，本机记录和服务端都不再参与)
+    if opts.chapter_uid ~= nil and open_picked_chapter(book_id, opts.chapter_uid) then
       return
     end
 
-    index = index or M.start_index()
-    chapter = chapter or ((state.catalog or {}).chapters or {})[index]
-    vim.notify(
-      string.format(
-        "weread: 续读《%s》· %s",
-        book.title or "?",
-        (chapter and chapter.title) or ("第 " .. tostring(index) .. " 章")
-      ),
+    local index, chapter, resuming = resume_point(book_id, book)
+
+    local function open_local()
+      if not resuming then
+        ui.notify(
+          string.format("weread: 《%s》还没有阅读记录，先看目录", book.title or "?"),
+          vim.log.levels.INFO,
+          { routine = true }
+        )
+        M.toc()
+        return
+      end
+
+      index = index or M.start_index()
+      chapter = chapter or session.chapters()[index]
+      -- Routine: the reader can see which chapter they are in from the winbar, and
+      -- this would pop up on every page turn.
+      -- (例行消息：章节名在 winbar 上就有，而这条会在每次翻页时弹出)
+      ui.notify(
+        string.format(
+          "weread: 续读《%s》· %s",
+          book.title or "?",
+          (chapter and chapter.title) or ("第 " .. tostring(index) .. " 章")
+        ),
+        vim.log.levels.INFO,
+        { routine = true }
+      )
+      M.open_index(index, { resume = true })
+    end
+
+    -- Ask the service where this book was left before showing anything: a
+    -- position from the phone must win over this machine's older one, and the
+    -- enter-report below must not fire first and bury it.
+    -- (显示之前先问服务端这本书读到了哪：手机上的位置要赢过本机更旧的记录，
+    --  而且不能让下面 enter 上报先发出去把它埋掉)
+    local ok_progress, progress = pcall(require, "weread.progress")
+    if not ok_progress or config.get().sync_pull == false then
+      open_local()
+      return
+    end
+    pending_remote = nil
+    progress.pull(book_id, function(remote)
+      if not state.book or tostring(state.book.book_id) ~= book_id then
+        -- another book was opened while this one was being asked about
+        -- (问这本书的时候，读者已经打开了另一本)
+        return
+      end
+      -- a remote chapter this catalog does not know is no reason to open nothing
+      -- (目录里没有的远端章节，不能成为什么都不打开的理由)
+      if remote and M.jump_to_remote(remote, { notify = true, on_fail = open_local }) then
+        return
+      end
+      open_local()
+    end)
+  end)
+end
+
+---Follow a newer position from another device — but only in the window that is
+---showing this book right now. Anywhere else (a code buffer, the shelf), the
+---jump waits until a chapter of the book is on screen again: replacing someone's
+---source file with a chapter is not a sync, it is a hijack.
+---(跟随另一端更新的位置——但只在此刻正显示这本书的窗口里跳。在别处（代码 buffer、书架），
+--- 跳转会等到这本书的章节再次出现在屏幕上：把别人的源文件换成章节不叫同步，叫劫持)
+---@param remote table from weread.progress.pull
+---@return boolean jumped
+function M.follow_remote(remote)
+  if remote.book_id and state.book and tostring(state.book.book_id) ~= tostring(remote.book_id) then
+    -- another book's answer, arriving late
+    -- (另一本书的回答，来晚了)
+    return false
+  end
+  if not M.current() then
+    pending_remote = remote
+    return false
+  end
+  pending_remote = nil
+  return M.jump_to_remote(remote, { notify = true })
+end
+
+---Apply a remote position that arrived while the reader was elsewhere.
+---(读者在别处时到达的远端位置，现在补上)
+---@return boolean
+function M.apply_pending_remote()
+  if not pending_remote or not M.current() then
+    return false
+  end
+  local remote = pending_remote
+  pending_remote = nil
+  if remote.book_id and tostring(remote.book_id) ~= tostring(state.book.book_id) then
+    return false
+  end
+  local ok, progress = pcall(require, "weread.progress")
+  if ok and not progress.remote_is_newer(tostring(state.book.book_id), remote) then
+    return false
+  end
+  return M.jump_to_remote(remote, { notify = true })
+end
+
+---Open the chapter and offset a remote device left the book at.
+---(打开其他端留下进度的那一章、那一句)
+---
+---`notify` announces the jump (the resume path); background jumps stay quiet
+---but still show in the winbar.
+---(`notify` 会宣布跳转（续读路径）；后台跳转保持安静，winbar 上自然可见)
+---@param remote table from weread.progress.pull
+---@param opts table|nil { notify = boolean }
+function M.jump_to_remote(remote, opts)
+  opts = opts or {}
+  if remote.book_id and (not state.book or tostring(state.book.book_id) ~= tostring(remote.book_id)) then
+    return false
+  end
+  local chapters = session.chapters()
+  local index = nil
+  for position, chapter in ipairs(chapters) do
+    if tostring(chapter.chapterUid) == tostring(remote.chapter_uid) and M.is_readable(chapter) then
+      index = position
+      break
+    end
+  end
+  if not index then
+    log.warn("remote chapter %s not in catalog; falling back to the local position", tostring(remote.chapter_uid))
+    return false
+  end
+  local chapter = chapters[index]
+  local ok, progress = pcall(require, "weread.progress")
+  if ok and progress.cancel_debounce then
+    progress.cancel_debounce()
+  end
+  -- The chapter may have to be downloaded first; by then the reader may be in
+  -- another window, so the jump is bound to the one it was meant for.
+  -- (章节可能要先下载；那时读者也许已经在别的窗口里了，因此跳转绑定在本来要跳的那个窗口)
+  local win = M.current() and vim.api.nvim_get_current_win() or nil
+  -- Held until the chapter is actually on screen: a download that fails or a
+  -- window that moved on must not count as "the reader is there now".
+  -- (扣到章节真的出现在屏幕上为止：下载失败、窗口换走了，都不能算「读者已经在那里了」)
+  if ok and progress.defer then
+    progress.defer(remote)
+  end
+  M.open_index(index, { source_offset = remote.chapter_offset, win = win, remote = remote, on_fail = opts.on_fail })
+  -- the phone's place arrives at the book (手机上的位置来到书上)
+  vim.schedule(function()
+    require("weread.sprites").moment("phone", "跟上了其他端的进度", { win = win })
+  end)
+  if opts.notify then
+    -- cut by characters: a byte cut splits a Chinese character in half
+    -- (按字符截断：按字节截会把汉字切成两半)
+    local summary = vim.fn.strcharpart(vim.trim(tostring(remote.summary or "")), 0, 12)
+    ui.notify(
+      string.format("weread: 已跳到其他端进度 · %s%s", chapter.title or "", summary ~= "" and (" · " .. summary) or ""),
       vim.log.levels.INFO
     )
-    M.open_index(index, { resume = true })
-  end)
+  end
+  return true
 end
 
 ---Close every chapter buffer of the current book.
@@ -854,6 +767,72 @@ function M.close()
       pcall(vim.api.nvim_buf_delete, buf, { force = true })
     end
   end
+end
+
+-- ------------------------------------------------------------------ quick hide
+
+---Chapter buffer and window hidden by M.hide, for the way back.
+---(被 M.hide 藏起来的章节 buffer 与窗口，回来时用)
+local hidden = nil
+
+---A buffer to show instead of a chapter: the alternate buffer when it is an
+---ordinary one, else the most recently used ordinary buffer, else a new empty
+---one.
+---(用来顶替章节的 buffer：交替 buffer 是普通 buffer 就用它，否则用最近用过的普通 buffer，
+--- 再没有就开一个空 buffer)
+---@return integer
+local function cover_buffer()
+  local function ordinary(buf)
+    return buf > 0
+      and vim.api.nvim_buf_is_valid(buf)
+      and vim.bo[buf].buflisted
+      and vim.bo[buf].buftype == ""
+      and not M.buffer_info(buf)
+  end
+  local alternate = vim.fn.bufnr("#")
+  if ordinary(alternate) then
+    return alternate
+  end
+  local best, best_used = nil, -1
+  for _, info in ipairs(vim.fn.getbufinfo({ buflisted = 1 })) do
+    if ordinary(info.bufnr) and info.lastused > best_used then
+      best, best_used = info.bufnr, info.lastused
+    end
+  end
+  if best then
+    return best
+  end
+  return vim.api.nvim_create_buf(true, false)
+end
+
+---Hide the book at once (老板键): the chapter window shows an ordinary buffer,
+---the reading shell steps back, and reading time stops counting. Called again
+---(or :WeReadHide) away from the book, it brings the chapter back.
+---(一键速隐（老板键）：章节窗口换成普通 buffer，阅读外壳退场，阅读时长停止计数。
+--- 离开书时再调一次（或 :WeReadHide）就把章节换回来)
+---@return boolean hid true when the book was hidden, false when it was restored(藏起时为 true，恢复时为 false)
+function M.hide()
+  local win = vim.api.nvim_get_current_win()
+  local buf = vim.api.nvim_get_current_buf()
+  if M.buffer_info(buf) then
+    hidden = { buf = buf, win = win }
+    -- BufLeave settles the reading time and saves the place, as for any
+    -- chapter switch
+    -- (BufLeave 会像任何一次切章那样结算阅读时长并保存位置)
+    vim.api.nvim_win_set_buf(win, cover_buffer())
+    vim.cmd("redraw")
+    return true
+  end
+  if hidden and vim.api.nvim_buf_is_valid(hidden.buf) then
+    local target = vim.api.nvim_win_is_valid(hidden.win) and hidden.win or win
+    vim.api.nvim_set_current_win(target)
+    vim.api.nvim_win_set_buf(target, hidden.buf)
+    hidden = nil
+    return false
+  end
+  hidden = nil
+  M.resume()
+  return false
 end
 
 -- ------------------------------------------------------------------ entry points
@@ -884,6 +863,43 @@ function M.resume()
   M.open_book(book_id, { resume = true })
 end
 
+---Picker items for the shelf, newest read first.
+---(书架选择器的条目，最近读过的在前)
+---@param books table[]
+---@return table[]
+local function shelf_items(books)
+  local positions = cache.read_positions()
+  local items = {}
+  for _, book in ipairs(books) do
+    -- The shelf payload carries no percentage, so show what is already known
+    -- locally plus the shelf's own badges instead of firing one progress
+    -- request per book.
+    -- (书架响应里没有百分比；改为展示本地已知位置与书架自带标记，避免对每本书
+    --  都发一次进度请求)
+    local position = positions[book.book_id]
+    local badges = {}
+    if book.finish_reading then
+      badges[#badges + 1] = "已读完"
+    end
+    if position and position.chapter_index then
+      badges[#badges + 1] = "本地读到第 " .. tostring(position.chapter_index) .. " 章"
+    end
+    if #badges == 0 then
+      badges[#badges + 1] = "最近 " .. ui.relative_time(book.read_update_time)
+    end
+
+    items[#items + 1] = {
+      text = string.format("%s · %s  [%s]", book.title, book.author ~= "" and book.author or "未知作者", table.concat(badges, ", ")),
+      book = book,
+    }
+  end
+
+  table.sort(items, function(left, right)
+    return (left.book.read_update_time or 0) > (right.book.read_update_time or 0)
+  end)
+  return items
+end
+
 ---Shelf picker.
 ---(书架选择器)
 function M.pick_book()
@@ -904,39 +920,29 @@ function M.pick_book()
       return
     end
 
-    local positions = cache.read_positions()
-    local items = {}
-    for _, book in ipairs(books) do
-      -- The shelf payload carries no percentage, so show what is already known
-      -- locally plus the shelf's own badges instead of firing one progress
-      -- request per book.
-      -- (书架响应里没有百分比；改为展示本地已知位置与书架自带标记，避免对每本书
-      --  都发一次进度请求)
-      local position = positions[book.book_id]
-      local badges = {}
-      if book.finish_reading then
-        badges[#badges + 1] = "已读完"
-      end
-      if position and position.chapter_index then
-        badges[#badges + 1] = "本地读到第 " .. tostring(position.chapter_index) .. " 章"
-      end
-      if #badges == 0 then
-        badges[#badges + 1] = "最近 " .. ui.relative_time(book.read_update_time)
-      end
-
-      items[#items + 1] = {
-        text = string.format("%s · %s  [%s]", book.title, book.author ~= "" and book.author or "未知作者", table.concat(badges, ", ")),
-        book = book,
-      }
-    end
-
-    table.sort(items, function(left, right)
-      return (left.book.read_update_time or 0) > (right.book.read_update_time or 0)
-    end)
-
+    local items = shelf_items(books)
     ui.select({
       title = "微信读书 · 书架（" .. #items .. " 本，按最近阅读排序）",
       items = items,
+      -- Detail preview for the highlighted book: rating, reviews and the
+      -- table of contents; uploaded books (no store life) get the TOC alone.
+      -- (高亮书籍的详情预览：评分、点评与目录；自己上传的书——书城无记载——只给目录)
+      preview = function(ctx)
+        require("weread.preview").snacks(ctx)
+      end,
+      -- Alt-r cycles the review filter from the list too, without leaving it
+      -- (在列表里按 Alt-r 也能切换点评筛选，不用离开列表)
+      snacks = {
+        actions = {
+          weread_cycle_reviews = function()
+            require("weread.preview").cycle_reviews()
+          end,
+        },
+        win = {
+          input = { keys = { ["<M-r>"] = { "weread_cycle_reviews", mode = { "n", "i" } } } },
+          list = { keys = { ["<M-r>"] = "weread_cycle_reviews" } },
+        },
+      },
       on_choice = function(item)
         M.open_book(item.book.book_id, {})
       end,
@@ -998,84 +1004,77 @@ function M.open_query(query)
   M.search_book(query)
 end
 
--- ------------------------------------------------------------------ autocmds
+---Change the line length while reading and lay the chapter out again around the
+---sentence the cursor is on. The choice is remembered unless the config names a
+---line length itself.
+---(阅读中改行宽，并围绕光标所在的句子重排本章。除非配置里自己写了行宽，这个选择会被记住)
+---@param chars integer|nil new line length in characters; nil keeps the current one(新行宽（汉字数）；nil 表示不变)
+---@param delta integer|nil change relative to the current line length(相对当前行宽的增减)
+---@return integer|nil chars applied(实际施加的行宽)
+function M.set_page_chars(chars, delta)
+  local opts = config.get().layout
+  local current = tonumber(opts.page_chars) or layout.defaults.page_chars
+  local win = vim.api.nvim_get_current_win()
+  if opts.adaptive or current <= 0 then
+    -- start from what is on screen, not from a number the reader never saw
+    -- (从屏幕上实际的宽度开始，而不是读者没见过的那个数)
+    current = math.floor((session.page_width() or layout.page_width(win)) / 2)
+  end
+  if current <= 0 then
+    -- a full-width page has no line length to step from (满宽页面没有可以步进的行宽)
+    current = layout.defaults.page_chars
+  end
+  local wanted = layout.clamp_chars((chars or current) + (delta or 0))
+  opts.page_chars = wanted
+  opts.adaptive = false
+  require("weread.prefs").set("page_chars", wanted)
+  local width = layout.page_width(win)
+  local info = M.buffer_info()
+  if info and width ~= session.page_width() then
+    local offset = M.source_offset(vim.api.nvim_get_current_buf(), win)
+    session.set_page_width(width)
+    layout.apply(win, width)
+    M.open_index(info.chapter_index, { line = vim.fn.line("."), source_offset = offset })
+  end
+  local message = string.format("weread: 每行 %d 字", wanted)
+  if width > 0 and math.floor(width / 2) < wanted then
+    message = message .. string.format("（窗口只放得下 %d 字）", math.floor(width / 2))
+  end
+  if config.pinned("layout.page_chars") then
+    message = message .. "（setup 里配置了 page_chars，重启后以配置为准）"
+  end
+  vim.notify(message)
+  return wanted
+end
 
----Persist the reading position when a chapter buffer loses focus.
----(章节 buffer 失焦时保存阅读位置)
----@param buf_override integer|nil
-save_position = function(buf_override)
-  -- Autocmd callbacks receive the event args table as their first positional
-  -- argument, so anything that is not a number means "the current buffer".
-  -- Reading a table as a buffer number silently made this function return early
-  -- — which is how the reading position ended up frozen at the top of the
-  -- chapter.
-  -- (autocmd 回调会把事件参数表当作第一个位置参数传进来，因此非数字一律视为「当前
-  --   buffer」。把表当 buffer 号会让本函数静默提前返回——阅读位置因此一直停在章节
-  --   开头)
-  local buf = (type(buf_override) == "number" and buf_override) or vim.api.nvim_get_current_buf()
-  local info = M.buffer_info(buf)
-  if not info then
+---Repaint a chapter window's winbar and statusline, e.g. after a theme change
+---swapped the highlight groups they refer to.
+---(重画章节窗口的 winbar 与状态栏，例如主题换掉了它们引用的高亮组之后)
+---@param win integer|nil
+function M.repaint(win)
+  win = win or vim.api.nvim_get_current_win()
+  if not vim.api.nvim_win_is_valid(win) then
     return
   end
-  pcall(cache.write_position, info.book_id, {
-    chapter_key = info.chapter_key,
-    chapter_index = info.chapter_index,
-    chapter_uid = info.chapter_uid,
-    line = vim.fn.line("."),
-    total_lines = vim.api.nvim_buf_line_count(buf),
-    updated_at = os.time(),
-  })
-end
-
----Leaving a chapter: remember the place and settle the reading time. Kept
----separate from save_position because opening a chapter records its own
----position too, and that must not flush progress.
----(离开章节：记住位置并结算阅读时长。与 save_position 分开，因为打开章节时也会记录
---- 位置，而那次不应触发进度结算)
-local function on_buf_leave()
-  save_position()
-  local ok, progress = pcall(require, "weread.progress")
-  if ok then
-    pcall(progress.leave, M)
+  local info = M.buffer_info(vim.api.nvim_win_get_buf(win))
+  if not info or not state.book then
+    return
+  end
+  local chapter = session.chapters()[info.chapter_index]
+  if not chapter then
+    return
+  end
+  local _, total = M.position_of(info.chapter_index)
+  reader_window.set_winbar(win, state.book, chapter, info.chapter_index, total)
+  local shell = require("weread.shell")
+  if (config.get().layout or {}).statusline == "window" then
+    vim.api.nvim_set_option_value("statusline", shell.statusline(), { scope = "local", win = win })
   end
 end
 
-local group = vim.api.nvim_create_augroup("weread_reader", { clear = true })
-vim.api.nvim_create_autocmd("BufLeave", {
-  group = group,
-  callback = on_buf_leave,
-})
--- Also checkpoint while reading, throttled: saving a JSON file on every cursor
--- hold would be wasteful, but only saving on leave loses the place on a crash.
--- (阅读中也定期存一次；每次 CursorHold 都写 JSON 太浪费，但只在离开时存又会在
---  崩溃时丢掉位置)
-local last_checkpoint = 0
-vim.api.nvim_create_autocmd({ "CursorHold", "CursorHoldI" }, {
-  group = group,
-  callback = function()
-    local now = os.time()
-    if now - last_checkpoint < 5 then
-      return
-    end
-    last_checkpoint = now
-    save_position()
-  end,
-})
-vim.api.nvim_create_autocmd({ "WinLeave", "VimLeavePre" }, {
-  group = group,
-  callback = function()
-    local buf = vim.api.nvim_get_current_buf()
-    if M.buffer_info(buf) then
-      pcall(cache.write_position, M.buffer_info(buf).book_id, {
-        chapter_key = M.buffer_info(buf).chapter_key,
-        chapter_index = M.buffer_info(buf).chapter_index,
-        chapter_uid = M.buffer_info(buf).chapter_uid,
-        line = vim.fn.line("."),
-        total_lines = vim.api.nvim_buf_line_count(buf),
-        updated_at = os.time(),
-      })
-    end
-  end,
-})
+-- Registered while the module loads, exactly as before the split: commands such
+-- as :WeReadNext require the reader without ever calling `weread()`.
+-- (和拆分之前一样在模块加载时注册：:WeReadNext 这类命令不经过 weread() 就直接 require 阅读器)
+reader_autocmds.setup(M)
 
 return M

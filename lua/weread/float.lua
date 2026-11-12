@@ -5,6 +5,8 @@ implementation.
 (通用居中浮窗：登录对话框、图片查看器、想法弹窗共用同一套布局/边框/快捷键实现)
 ]]
 
+local log = require("weread.log")
+
 local M = {}
 
 ---@class weread.float
@@ -25,7 +27,11 @@ local function hook_close(win, on_close)
     pattern = tostring(win),
     once = true,
     callback = function()
-      pcall(on_close)
+      -- an on_close that throws must not vanish: log it (抛错的 on_close 不能凭空消失：记日志)
+      local ok, err = pcall(on_close)
+      if not ok then
+        log.warn("float on_close failed: %s", tostring(err))
+      end
     end,
   })
 end
@@ -71,8 +77,20 @@ function M.open(opts)
     win_config.title = opts.title
     win_config.title_pos = "center"
   end
+  -- Same rule for the footer (页脚同理)
+  if type(opts.footer) == "string" and opts.footer ~= "" then
+    win_config.footer = opts.footer
+    win_config.footer_pos = "center"
+  end
 
+  -- asked before the float opens: once it is entered, the chapter is no
+  -- longer the current window
+  -- (在浮窗打开之前问：一旦进入浮窗，当前窗口就不再是章节了)
+  local page = require("weread.theme").float_winhighlight()
   local win = vim.api.nvim_open_win(buf, opts.enter ~= false, win_config)
+  if page ~= "" then
+    vim.wo[win].winhighlight = page
+  end
 
   vim.wo[win].wrap = opts.wrap ~= false
   vim.wo[win].cursorline = false
@@ -151,6 +169,22 @@ function Float:set_title(title)
     return
   end
   vim.api.nvim_win_set_config(self.win, { title = title, title_pos = "center" })
+end
+
+---Set the bottom border text; an empty string clears it.
+---(设置底部边框文字；空串清除)
+---@param footer string|nil
+function Float:set_footer(footer)
+  if not vim.api.nvim_win_is_valid(self.win) then
+    return
+  end
+  if type(footer) ~= "string" or footer == "" then
+    -- `footer_pos` without a footer is rejected, so clear with an empty footer only
+    -- (没有 footer 时不能带 footer_pos，因此清除时只传空 footer)
+    vim.api.nvim_win_set_config(self.win, { footer = "" })
+    return
+  end
+  vim.api.nvim_win_set_config(self.win, { footer = footer, footer_pos = "center" })
 end
 
 ---@return integer

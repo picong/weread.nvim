@@ -90,3 +90,74 @@ describe("float lifecycle", function()
     truthy(ok, "set_lines survives an invalid buffer")
   end)
 end)
+
+describe("float keys and decorations", function()
+  it("closes with q", function()
+    local win = open({ "x" })
+    vim.api.nvim_buf_call(win:get_buf(), function()
+      vim.fn.maparg("q", "n", false, true).callback()
+    end)
+    falsy(win:is_open())
+  end)
+
+  it("ignores title, footer and lines changes after it was closed", function()
+    local win = open({ "x" })
+    win:close()
+    win:set_title("晚了")
+    win:set_footer("晚了")
+    win:set_lines({ "晚了" })
+    falsy(win:is_open())
+  end)
+end)
+
+---Replace `log.warn` with a recorder for the duration of `body`.
+---(在 `body` 期间把 `log.warn` 换成记录器)
+---@param body fun(warnings: string[])
+local function with_warnings(body)
+  local log = require("weread.log")
+  local warnings = {}
+  local original = log.warn
+  log.warn = function(format, ...)
+    warnings[#warnings + 1] = string.format(format, ...)
+  end
+  local ok, err = pcall(body, warnings)
+  log.warn = original
+  if not ok then
+    error(err, 0)
+  end
+end
+
+describe("float on_close", function()
+  it("runs when the window closes", function()
+    local ran = 0
+    local win = open({ "x" }, {
+      on_close = function()
+        ran = ran + 1
+      end,
+    })
+    win:close()
+    eq(ran, 1)
+  end)
+
+  it("logs a handler that throws, and the window still closes", function()
+    with_warnings(function(warnings)
+      local win = open({ "x" }, {
+        on_close = function()
+          error("handler broke")
+        end,
+      })
+      win:close()
+      falsy(win:is_open())
+      eq(#warnings, 1)
+      matches(warnings[1], "float on_close failed")
+      matches(warnings[1], "handler broke")
+    end)
+  end)
+
+  it("logs nothing for a handler that behaves", function()
+    with_warnings(function(warnings)
+      open({ "x" }, { on_close = function() end }):close()
+      eq(#warnings, 0)
+    end)
+  end)
+end)
