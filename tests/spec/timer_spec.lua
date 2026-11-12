@@ -1,88 +1,210 @@
 --[[
-Tests for weread.timer.
+Tests for weread.timer: the stoppable timers and the trailing-edge debounce.
+(timer 单测：可停止的定时器与尾沿防抖)
 
-The regression this guards against: `vim.defer_fn` returns a uv timer handle,
-and `vim.fn.timer_stop` cannot accept it. The old code therefore "stopped" a
-timer that kept running, which stacked a new repeating timer on every setup.
-(本文件守护的回归：vim.defer_fn 返回 uv timer 句柄，vim.fn.timer_stop 收不了它。
- 旧代码因此「停止」了一个仍在运行的定时器，每次 setup 都会再叠一个重复定时器)
+The callbacks run through `vim.schedule_wrap`, so the tests wait on the main loop
+with `vim.wait` instead of sleeping.
+(回调经 vim.schedule_wrap 在主循环里执行，因此测试用 vim.wait 等主循环，而不是睡眠)
 ]]
 
 local timer = require("weread.timer")
 
-describe("timer.defer", function()
-  it("runs the callback once", function()
-    local calls = 0
-    timer.defer(function()
-      calls = calls + 1
-    end, 10)
-    vim.wait(500, function()
-      return calls > 0
-    end, 10)
-    eq(calls, 1)
+---Let the main loop run for `ms`, asserting nothing.
+---(让主循环跑 ms 毫秒，不做断言)
+---@param ms integer
+local function settle(ms)
+  vim.wait(ms, function()
+    return false
+  end, 5)
+end
+
+describe("weread.timer.debounce", function()
+  it("fires once for a burst of calls", function()
+    local runs = 0
+    local debounced = timer.debounce(function()
+      runs = runs + 1
+    end, 40)
+    for _ = 1, 5 do
+      debounced.call()
+    end
+    eq(runs, 0, "nothing runs on the leading edge")
+    truthy(vim.wait(1000, function()
+      return runs > 0
+    end, 5), "it runs after the quiet")
+    settle(120)
+    eq(runs, 1, "and only once")
   end)
 
-  it("can actually be stopped before it fires", function()
-    local calls = 0
-    local handle = timer.defer(function()
-      calls = calls + 1
-    end, 60)
-    truthy(handle, "a handle came back")
-
-    timer.stop(handle)
-    vim.wait(400, function()
-      return false
-    end, 20)
-    eq(calls, 0, "a stopped one-shot must never run")
+  it("runs with the arguments of the last call", function()
+    local got
+    local debounced = timer.debounce(function(...)
+      got = vim.F.pack_len(...)
+    end, 40)
+    debounced.call("first", 1)
+    debounced.call("second", 2)
+    debounced.call("third", nil, 3)
+    truthy(vim.wait(1000, function()
+      return got ~= nil
+    end, 5))
+    eq(got.n, 3, "trailing nils are kept")
+    eq(got[1], "third")
+    eq(got[2], nil)
+    eq(got[3], 3)
   end)
 
-  it("tolerates being stopped twice and after firing", function()
-    local calls = 0
-    local handle = timer.defer(function()
-      calls = calls + 1
-    end, 10)
-    vim.wait(300, function()
-      return calls > 0
-    end, 10)
-    eq(calls, 1)
+  it("restarts the wait on every call", function()
+    local ran_at
+    local debounced = timer.debounce(function()
+      ran_at = vim.uv.hrtime()
+    end, 80)
+    local last_call
+    for _ = 1, 3 do
+      debounced.call()
+      last_call = vim.uv.hrtime()
+      settle(40)
+    end
+    truthy(vim.wait(1000, function()
+      return ran_at ~= nil
+    end, 5))
+    -- 3 x 40 ms of calls, each inside the 80 ms window of the one before: had the
+    -- first call's timer survived, the run would have come before the last call
+    -- (三次调用每次间隔 40 毫秒、都落在前一次的 80 毫秒窗口内：若第一次的计时没被取消，
+    --  执行会早于最后一次调用)
+    truthy(ran_at > last_call, "the run came after the last call")
+    truthy((ran_at - last_call) / 1e6 >= 60, "and a full wait after it")
+  end)
 
-    -- stopping after the callback closed the handle must be a no-op, not an
-    -- error, because callers cannot know the timing
-    -- (回调关闭句柄之后再 stop 必须是空操作而不是报错：调用方无法预知时序)
-    timer.stop(handle)
-    timer.stop(handle)
-    timer.stop(nil)
-    truthy(true, "no error raised")
+  it("does not fire after cancel", function()
+    local runs = 0
+    local debounced = timer.debounce(function()
+      runs = runs + 1
+    end, 30)
+    debounced.call()
+    debounced.cancel()
+    settle(150)
+    eq(runs, 0)
+  end)
+
+  it("can be cancelled with nothing pending, and twice", function()
+    local debounced = timer.debounce(function() end, 30)
+    debounced.cancel()
+    debounced.call()
+    debounced.cancel()
+    debounced.cancel()
+    settle(80)
+  end)
+
+  it("can be called again after it fired", function()
+    local seen = {}
+    local debounced = timer.debounce(function(value)
+      seen[#seen + 1] = value
+    end, 30)
+    debounced.call("a")
+    truthy(vim.wait(1000, function()
+      return #seen == 1
+    end, 5))
+    debounced.call("b")
+    truthy(vim.wait(1000, function()
+      return #seen == 2
+    end, 5))
+    eq(seen, { "a", "b" })
+  end)
+
+  it("can be called again after a cancel", function()
+    local seen = {}
+    local debounced = timer.debounce(function(value)
+      seen[#seen + 1] = value
+    end, 30)
+    debounced.call("dropped")
+    debounced.cancel()
+    debounced.call("kept")
+    truthy(vim.wait(1000, function()
+      return #seen > 0
+    end, 5))
+    settle(100)
+    eq(seen, { "kept" })
+  end)
+
+  it("keeps separate debouncers apart", function()
+    local a, b = 0, 0
+    local first = timer.debounce(function()
+      a = a + 1
+    end, 30)
+    local second = timer.debounce(function()
+      b = b + 1
+    end, 30)
+    first.call()
+    second.call()
+    second.cancel()
+    truthy(vim.wait(1000, function()
+      return a > 0
+    end, 5))
+    settle(100)
+    eq(a, 1)
+    eq(b, 0, "cancelling one does not touch the other")
   end)
 end)
 
-describe("timer.every", function()
-  it("fires repeatedly and stops on request", function()
-    local ticks = 0
-    local handle = timer.every(function()
-      ticks = ticks + 1
-    end, 20)
-    truthy(handle)
-
-    vim.wait(500, function()
-      return ticks >= 3
-    end, 10)
-    truthy(ticks >= 3, "repeats: " .. ticks)
-
+describe("weread.timer.defer and stop", function()
+  it("stop prevents a deferred call, and may be repeated", function()
+    local ran = false
+    local handle = timer.defer(function()
+      ran = true
+    end, 30)
     timer.stop(handle)
-    local seen = ticks
-    vim.wait(300, function()
-      return false
-    end, 20)
-    eq(ticks, seen, "no ticks after stop")
+    timer.stop(handle)
+    timer.stop(nil)
+    settle(120)
+    falsy(ran)
   end)
 
-  it("does not keep the event loop alive", function()
-    -- unref'ed handles must not block `:qa`; this is a smoke assertion that the
-    -- handle is at least usable
-    -- (unref 过的句柄不应拖住 :qa；这里只是确认句柄可用)
-    local handle = timer.every(function() end, 1000)
-    truthy(handle)
+  it("a stop from inside the callback is a no-op", function()
+    local handle
+    local ran = false
+    handle = timer.defer(function()
+      ran = true
+      timer.stop(handle)
+    end, 10)
+    truthy(vim.wait(1000, function()
+      return ran
+    end, 5))
+  end)
+end)
+
+describe("weread.timer.defer stopped after it fired", function()
+  it("does not run a call stopped between firing and the scheduled callback", function()
+    local timer = require("weread.timer")
+    local ran = false
+    local handle = timer.defer(function()
+      ran = true
+    end, 0)
+    -- let the uv timer fire (queueing the scheduled callback) without letting
+    -- the main loop run it, then stop the handle
+    -- (让 uv 定时器到期（排上那次 schedule 回调），但不让主循环执行它，然后 stop)
+    vim.uv.run("nowait")
+    vim.uv.sleep(5)
+    vim.uv.run("nowait")
     timer.stop(handle)
+    vim.wait(50)
+    falsy(ran, "the cancelled call did not happen")
+  end)
+end)
+
+describe("weread.timer.debounce with a call already on its way", function()
+  it("lets cancel stop the newest call even after an older one fired", function()
+    local timer = require("weread.timer")
+    local ran = {}
+    local debounced = timer.debounce(function(name)
+      ran[#ran + 1] = name
+    end, 0)
+    debounced.call("A")
+    -- A's timer fires and its scheduled callback is queued (A 的定时器到期，回调已排队)
+    vim.uv.run("nowait")
+    vim.uv.sleep(5)
+    vim.uv.run("nowait")
+    debounced.call("B")
+    debounced.cancel()
+    vim.wait(50)
+    eq(ran, {}, "neither ran: A was replaced, B was cancelled")
   end)
 end)

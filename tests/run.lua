@@ -16,6 +16,15 @@ end
 
 vim.opt.runtimepath:prepend(root)
 
+-- The machine running the suite may have a real Claude Code gateway in its
+-- environment and in ~/.claude/settings.json: `K` and the 译文 key would send
+-- book text to it. No spec may, so both are hidden from every spec.
+-- (跑测试的机器可能在环境变量和 ~/.claude/settings.json 里有真实的 Claude Code 网关：K 与译文键
+--  会把书的文字发过去。任何 spec 都不该这样，所以对所有 spec 都藏起来)
+vim.env.ANTHROPIC_BASE_URL = nil
+vim.env.ANTHROPIC_AUTH_TOKEN = nil
+vim.env.WEREAD_CLAUDE_SETTINGS = vim.fn.tempname() .. "-no-claude-settings.json"
+
 local framework = dofile(root .. "/tests/framework.lua")
 _G.describe = framework.describe
 _G.it = framework.it
@@ -25,16 +34,24 @@ _G.falsy = framework.falsy
 _G.matches = framework.matches
 _G.raises = framework.raises
 
+-- Optional filter: `sh scripts/test.sh reader` runs only spec files whose name
+-- contains "reader"; the SPEC env var does the same.
+-- (可选过滤：`sh scripts/test.sh reader` 只跑文件名含 "reader" 的 spec；环境变量 SPEC 同效)
+local filter = arg and arg[1] or vim.env.SPEC
+if filter == "" then
+  filter = nil
+end
+
 local specs = {}
 for name, kind in vim.fs.dir(root .. "/tests/spec") do
-  if kind == "file" and name:match("_spec%.lua$") then
+  if kind == "file" and name:match("_spec%.lua$") and (not filter or name:find(filter, 1, true)) then
     specs[#specs + 1] = name
   end
 end
 table.sort(specs)
 
 if #specs == 0 then
-  io.stderr:write("no specs found under tests/spec\n")
+  io.stderr:write("no specs found under tests/spec" .. (filter and (" matching '" .. filter .. "'") or "") .. "\n")
   os.exit(2)
 end
 

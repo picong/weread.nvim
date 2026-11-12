@@ -28,13 +28,17 @@ function M.defer(fn, ms)
     return nil
   end
   timer:start(math.max(0, math.floor(ms)), 0, vim.schedule_wrap(function()
+    -- Stopped after it fired but before this scheduled call ran: the timer is
+    -- already closing, and a cancelled call must not happen.
+    -- (到期之后、这次排队的调用执行之前被 stop 了：定时器已经在关闭，被取消的调用不能发生)
+    if timer:is_closing() then
+      return
+    end
     -- Close before running the callback, so a `stop` from inside it is a no-op
     -- rather than a double close.
     -- (先关闭再执行回调，这样回调里再 stop 是空操作而不是重复关闭)
-    if not timer:is_closing() then
-      timer:stop()
-      timer:close()
-    end
+    timer:stop()
+    timer:close()
     fn()
   end))
   return timer
@@ -53,6 +57,43 @@ function M.every(fn, ms)
   timer:start(math.max(1, math.floor(ms)), math.max(1, math.floor(ms)), vim.schedule_wrap(fn))
   timer:unref()
   return timer
+end
+
+---Trailing-edge debounce: every `call` restarts the wait, `fn` runs once after
+---`ms` of quiet with the arguments of the last call. `cancel` drops a pending run.
+---(尾沿防抖：每次 call 重新计时，安静 ms 毫秒后用最后一次的参数执行一次 fn；
+--- cancel 丢弃尚未执行的那一次)
+---@param fn fun(...)
+---@param ms integer
+---@return { call: fun(...), cancel: fun() }
+function M.debounce(fn, ms)
+  local pending
+  local debounced = {}
+
+  function debounced.cancel()
+    M.stop(pending)
+    pending = nil
+  end
+
+  function debounced.call(...)
+    -- LuaJIT has no `table.pack`; `vim.F.pack_len` keeps trailing nils too
+    -- (LuaJIT 没有 `table.pack`；`vim.F.pack_len` 同样保留末尾的 nil)
+    local args = vim.F.pack_len(...)
+    M.stop(pending)
+    local handle
+    handle = M.defer(function()
+      -- only the newest call clears the slot: an older one that was already on
+      -- its way must not wipe a newer handle, or `cancel` would stop nothing
+      -- (只有最新一次调用才清空槽位：已经在路上的旧回调不能抹掉新的句柄，否则 cancel 什么也停不了)
+      if pending == handle then
+        pending = nil
+      end
+      fn(vim.F.unpack_len(args))
+    end, ms)
+    pending = handle
+  end
+
+  return debounced
 end
 
 ---Stop and close a timer created by this module. Safe to call twice.

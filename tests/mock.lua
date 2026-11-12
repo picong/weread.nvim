@@ -95,20 +95,38 @@ function M.start(routes)
         end
       end
 
-      local payload = table.concat({
+      local head_lines = {
         "HTTP/1.1 " .. tostring(response.status),
         "Content-Type: " .. response.ctype,
         "Content-Length: " .. #response.body,
         "Connection: close",
-        "",
-        response.body,
-      }, "\r\n")
+      }
+      -- extra response headers, e.g. Set-Cookie (额外的响应头，例如 Set-Cookie)
+      for _, line in ipairs(response.headers or {}) do
+        head_lines[#head_lines + 1] = line
+      end
+      head_lines[#head_lines + 1] = ""
+      head_lines[#head_lines + 1] = response.body
+      local payload = table.concat(head_lines, "\r\n")
 
-      client:write(payload, function()
-        pcall(function()
-          client:close()
+      local function send()
+        client:write(payload, function()
+          pcall(function()
+            client:close()
+          end)
         end)
-      end)
+      end
+      -- `delay` (ms) holds the answer back, to finish requests in a chosen order
+      -- (`delay`（毫秒）推迟应答，用来让请求按指定顺序结束)
+      if response.delay then
+        local hold = vim.uv.new_timer()
+        hold:start(response.delay, 0, function()
+          hold:close()
+          send()
+        end)
+      else
+        send()
+      end
     end)
   end)
 
@@ -165,6 +183,27 @@ function M.weread_routes(ref)
   local tar = M.fixture_bytes("images.tar")
 
   return {
+    {
+      -- The official Agent API gateway, for specs that exercise remote progress
+      -- pulls. `ref.progress` is read per request, so a spec can restage it.
+      -- (官方 Agent API 网关，供测远端进度拉取的 spec 用。ref.progress 按请求读取，
+      --  因此 spec 可以随时换场景)
+      path = "/api/agent/gateway",
+      handler = function(_, _, body)
+        local ok, request = pcall(vim.json.decode, body or "")
+        if not ok or not request.api_name then
+          return { status = 400, ctype = "text/plain", body = "not a gateway call" }
+        end
+        if request.api_name ~= "/book/getprogress" then
+          return { status = 404, ctype = "text/plain", body = "unknown api_name " .. tostring(request.api_name) }
+        end
+        local remote = ref.progress
+        if type(remote) ~= "table" then
+          return { status = 200, ctype = "application/json", body = '{"errCode":-2012,"errMsg":"登录超时"}' }
+        end
+        return { status = 200, ctype = "application/json", body = vim.json.encode({ book = remote }) }
+      end,
+    },
     {
       path = "/web/reader/",
       handler = function()

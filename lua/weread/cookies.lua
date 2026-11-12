@@ -191,13 +191,17 @@ function M.load(path)
   return M.parse(text)
 end
 
+---Write the jar atomically with mode 0600: a failed write must leave the old
+---jar intact, since it holds the session credentials. Returns instead of
+---raising so a login flow can report the failure.
+---(原子写入 jar，权限 0600：写失败必须保留旧 jar，因为里面是会话凭据。返回错误而不抛异常，
+--- 登录流程才能把失败报告出来)
 ---@param path string
 ---@param cookies table[]
+---@return boolean|nil ok
+---@return string|nil err
 function M.save(path, cookies)
-  local file = assert(io.open(path, "wb"))
-  file:write(M.serialize(cookies))
-  file:close()
-  pcall(vim.uv.fs_chmod, path, 384) -- 0600, credentials must stay private(凭据文件必须保持私有)
+  return require("weread.cache").atomic_write(path, M.serialize(cookies), 384) -- 0600(凭据文件必须保持私有)
 end
 
 return M
