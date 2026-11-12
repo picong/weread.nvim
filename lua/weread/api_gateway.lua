@@ -19,8 +19,15 @@ local log = require("weread.log")
 
 local M = {}
 
-local DEFAULT_ORIGIN = "https://i.weread.qq.com"
 local DEFAULT_PATH = "/api/agent/gateway"
+
+---WeRead uses 0/1 for booleans in several payloads.
+---(微信读书有些字段用 0/1 表示布尔)
+---@param value any
+---@return boolean
+local function tool_truthy(value)
+  return value == true or tonumber(value) == 1
+end
 
 ---Resolve the gateway endpoint.
 ---(解析 gateway 端点地址)
@@ -34,7 +41,7 @@ local DEFAULT_PATH = "/api/agent/gateway"
 function M.gateway_url()
   local configured = config.get().gateway_url
   if not configured or configured == "" then
-    return DEFAULT_ORIGIN .. DEFAULT_PATH
+    configured = config.defaults.gateway_url
   end
   if configured:match("^https?://[^/]+/?$") then
     return (configured:gsub("/$", "")) .. DEFAULT_PATH
@@ -73,6 +80,10 @@ function M.call(api_name, params, opts, callback)
     json = true,
     body = body,
     timeout = opts.timeout or 20,
+    -- A background pull must answer quickly or not at all: three attempts at a
+    -- few seconds each is a reader left waiting for half a minute.
+    -- (后台拉取要么快速回答，要么干脆不答：每次几秒、重试三次，读者就得等半分钟)
+    retries = opts.retries,
     headers = { Authorization = "Bearer " .. key },
     referer = false,
     origin = false,
@@ -89,7 +100,7 @@ function M.call(api_name, params, opts, callback)
       callback(false, "微信读书 Agent API 要求升级 skill_version，请更新 weread.nvim")
       return
     end
-    if not auth.check(data) then
+    if not auth.check(data, { silent = opts.silent }) then
       callback(false, auth.describe_error(data) or "接口返回错误")
       return
     end
@@ -121,16 +132,30 @@ function M.shelf(callback)
   end)
 end
 
+---Book metadata (rating, intro, ...). Silent by default: the shelf preview
+---renders failures inline, so they must not pop a notify.
+---(书籍元信息（评分、简介等）。默认静默：书架预览把失败内联渲染，不能再弹通知)
 ---@param book_id string
+---@param opts table|nil { silent = boolean } default true(默认 true)
 ---@param callback fun(ok: boolean, result: table|string)
-function M.book_info(book_id, callback)
-  M.call("/book/info", { bookId = tostring(book_id) }, callback)
+function M.book_info(book_id, opts, callback)
+  if type(opts) == "function" then
+    callback = opts
+    opts = nil
+  end
+  opts = opts or {}
+  M.call("/book/info", { bookId = tostring(book_id) }, { silent = opts.silent ~= false }, callback)
 end
 
 ---@param book_id string
+---@param opts table|nil { timeout = integer, retries = integer, silent = boolean }
 ---@param callback fun(ok: boolean, result: table|string)
-function M.progress(book_id, callback)
-  M.call("/book/getprogress", { bookId = tostring(book_id) }, callback)
+function M.progress(book_id, opts, callback)
+  if type(opts) == "function" then
+    callback = opts
+    opts = nil
+  end
+  M.call("/book/getprogress", { bookId = tostring(book_id) }, opts, callback)
 end
 
 ---@param keyword string
@@ -173,12 +198,158 @@ function M.search(keyword, opts, callback)
   end)
 end
 
----WeRead uses 0/1 for booleans in several payloads.
----(微信读书有些字段用 0/1 表示布尔)
----@param value any
----@return boolean
-function tool_truthy(value)
-  return value == true or tonumber(value) == 1
+---Public reviews written by other readers for one book.
+---(一本书的公开点评——别的读者写的，不是我的笔记)
+---Failures stay silent by default: the preview renders them inline.
+---(默认静默失败：预览会把错误内联渲染)
+---@param book_id string
+---@param opts table|nil { count = integer, list_type = integer, max_idx = integer, silent = boolean } silent defaults to true(默认 true)
+---@param callback fun(ok: boolean, result: table|string)
+function M.review_list(book_id, opts, callback)
+  if type(opts) == "function" then
+    callback = opts
+    opts = nil
+  end
+  opts = opts or {}
+  M.call("/review/list", {
+    bookId = tostring(book_id),
+    reviewListType = opts.list_type or 0,
+    count = opts.count or 20,
+    maxIdx = opts.max_idx or 0,
+    synckey = 0,
+  }, { silent = opts.silent ~= false }, function(ok, data)
+    if not ok then
+      callback(false, data)
+      return
+    end
+    -- The payload nests the text one level deeper than the id:
+    -- entry.review.reviewId but entry.review.review.content.
+    -- (负载里文本比 id 多包了一层：entry.review.reviewId 但 entry.review.review.content)
+    local reviews = {}
+    for _, entry in ipairs(data.reviews or {}) do
+      local outer = type(entry.review) == "table" and entry.review or {}
+      local inner = type(outer.review) == "table" and outer.review or outer
+      local author = type(inner.author) == "table" and inner.author or {}
+      reviews[#reviews + 1] = {
+        name = type(author.name) == "string" and author.name or nil,
+        star = tonumber(inner.star),
+        content = type(inner.content) == "string" and inner.content
+          or type(outer.content) == "string" and outer.content
+          or "",
+        create_time = tonumber(inner.createTime),
+        is_finish = tool_truthy(inner.isFinish),
+      }
+    end
+    callback(true, { total = tonumber(data.reviewsCnt), reviews = reviews })
+  end)
+end
+
+---The chapter table of one book, from the official API (no reader pipeline).
+---Silent: the preview falls back to the web catalog on failure and renders
+---the outcome inline.
+---(一本书的章节目录，走官方 API——不经网页阅读器链路。静默失败：预览失败时会回退到
+--- 网页目录，并把结果内联渲染)
+---@param book_id string
+---@param callback fun(ok: boolean, result: table|string)
+function M.chapter_info(book_id, callback)
+  M.call("/book/chapterinfo", { bookId = tostring(book_id) }, { silent = true }, function(ok, data)
+    if not ok then
+      callback(false, data)
+      return
+    end
+    local chapters = {}
+    for _, chapter in ipairs(data.chapters or {}) do
+      chapters[#chapters + 1] = {
+        uid = chapter.chapterUid,
+        idx = tonumber(chapter.chapterIdx),
+        title = type(chapter.title) == "string" and chapter.title or "",
+        level = tonumber(chapter.level) or 1,
+        word_count = tonumber(chapter.wordCount),
+      }
+    end
+    callback(true, { chapters = chapters })
+  end)
+end
+
+---Reading statistics for one calendar period: total time, per-bucket times
+---(days of a week/month, months of a year, years overall), reading days, the
+---longest-read books and the reader's preferences.
+---(一个自然周期的阅读统计：总时长、分桶时长（周/月按天，年按月，全部按年）、阅读天数、
+--- 读得最久的书与阅读偏好)
+---@param mode "weekly"|"monthly"|"annually"|"overall"
+---@param base_time integer|nil start of the period (unix seconds), 0/nil = the current one(周期起点，0 或 nil 为当前周期)
+---@param callback fun(ok: boolean, result: table|string)
+function M.read_stats(mode, base_time, callback)
+  M.call("/readdata/detail", { mode = mode, baseTime = base_time or 0 }, function(ok, data)
+    if not ok then
+      callback(false, data)
+      return
+    end
+    -- readTimes is keyed by the bucket's start time as a string
+    -- (readTimes 以分桶起点时间的字符串为键)
+    local buckets = {}
+    for key, seconds in pairs(type(data.readTimes) == "table" and data.readTimes or {}) do
+      local at = tonumber(key)
+      if at then
+        buckets[#buckets + 1] = { at = at, seconds = tonumber(seconds) or 0 }
+      end
+    end
+    table.sort(buckets, function(left, right)
+      return left.at < right.at
+    end)
+    local longest = {}
+    for _, entry in ipairs(type(data.readLongest) == "table" and data.readLongest or {}) do
+      -- audiobook entries carry `albumInfo` instead of `book`, often empty
+      -- (听书条目带的是 albumInfo 而不是 book，而且经常是空的)
+      local book = type(entry.book) == "table" and entry.book
+        or type(entry.albumInfo) == "table" and entry.albumInfo
+        or {}
+      longest[#longest + 1] = {
+        title = type(book.title) == "string" and book.title or (type(book.name) == "string" and book.name or ""),
+        audio = entry.book == nil and entry.albumInfo ~= nil,
+        author = type(book.author) == "string" and book.author or "",
+        seconds = tonumber(entry.readTime) or 0,
+        tags = type(entry.tags) == "table" and entry.tags or {},
+      }
+    end
+    local facts = {}
+    for _, stat in ipairs(type(data.readStat) == "table" and data.readStat or {}) do
+      if type(stat.stat) == "string" and type(stat.counts) == "string" then
+        facts[#facts + 1] = { name = stat.stat, value = stat.counts }
+      end
+    end
+    local categories = {}
+    for _, category in ipairs(type(data.preferCategory) == "table" and data.preferCategory or {}) do
+      categories[#categories + 1] = {
+        title = category.categoryTitle or category.parentCategoryTitle or "",
+        seconds = tonumber(category.readingTime) or 0,
+        books = tonumber(category.readingCount) or 0,
+      }
+    end
+    local prefer_time = nil
+    if type(data.preferTime) == "table" and #data.preferTime == 24 then
+      prefer_time = {}
+      for index, seconds in ipairs(data.preferTime) do
+        prefer_time[index] = tonumber(seconds) or 0
+      end
+    end
+    callback(true, {
+      mode = mode,
+      base_time = tonumber(data.baseTime) or 0,
+      total = tonumber(data.totalReadTime) or 0,
+      day_average = tonumber(data.dayAverageReadTime),
+      read_days = tonumber(data.readDays) or 0,
+      compare = tonumber(data.compare),
+      listen = tonumber(data.wrListenTime),
+      buckets = buckets,
+      longest = longest,
+      facts = facts,
+      categories = categories,
+      prefer_time = prefer_time,
+      prefer_time_word = type(data.preferTimeWord) == "string" and data.preferTimeWord or nil,
+      prefer_category_word = type(data.preferCategoryWord) == "string" and data.preferCategoryWord or nil,
+    })
+  end)
 end
 
 return M

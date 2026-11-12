@@ -86,6 +86,7 @@ end
 local fake_http = {
   routes = {},
   requests = {},
+  handles = {},
   jar = {},
 }
 
@@ -93,14 +94,17 @@ function fake_http.setup() end
 function fake_http.load_cookies()
   return vim.deepcopy(fake_http.jar)
 end
+-- `jar_error` makes the next jar writes fail the way the real layer reports it.
+-- (jar_error 让之后的 jar 写入按真实层的方式失败)
 function fake_http.set_cookies(list)
+  if fake_http.jar_error then
+    return nil, fake_http.jar_error
+  end
   fake_http.jar = vim.deepcopy(list)
+  return true
 end
 function fake_http.clear_cookies()
-  fake_http.jar = {}
-end
-function fake_http.cookie_header()
-  return ""
+  return fake_http.set_cookies({})
 end
 function fake_http.decode_json(res)
   if not res or res.code == 0 or not res.body or res.body == "" then
@@ -118,10 +122,26 @@ end
 
 function fake_http.request(opts, callback)
   fake_http.requests[#fake_http.requests + 1] = opts
+  -- Like the real client, hand back a handle that can abort the request.
+  -- (与真实客户端一样，返回一个可中止请求的句柄)
+  local handle = { killed = false }
+  function handle.kill()
+    handle.killed = true
+  end
+  fake_http.handles[#fake_http.handles + 1] = handle
   for _, route in ipairs(fake_http.routes) do
     if opts.url:find(route.pattern, 1, true) and #route.queue > 0 then
       local response = table.remove(route.queue, 1)
-      if response == "pending" then
+      if response == "hold" then
+        -- The answer arrives later, when the spec calls `release`.
+        -- (应答稍后到，由 spec 调用 release 触发)
+        handle.release = function(result)
+          callback(result)
+        end
+        return handle
+      elseif type(response) == "table" and response.raise then
+        error(response.raise)
+      elseif response == "pending" then
         callback({ code = 0, error = "curl: (28) timed out", status = nil, headers = {} })
       else
         callback({
@@ -131,7 +151,7 @@ function fake_http.request(opts, callback)
           headers = response.headers or {},
         })
       end
-      return
+      return handle
     end
   end
   error("unexpected request or empty route queue: " .. opts.url)
@@ -139,15 +159,24 @@ end
 
 local fake_qr = { shown = {} }
 function fake_qr.show(text, opts)
-  fake_qr.shown[#fake_qr.shown + 1] = { text = text, title = opts and opts.title }
+  local entry = { text = text, title = opts and opts.title, opts = opts, footers = {}, titles = {} }
+  fake_qr.shown[#fake_qr.shown + 1] = entry
   return {
-    mode = "ascii",
+    mode = "text",
     float = {
+      width = 80,
       is_open = function()
         return true
       end,
-      close = function() end,
-      set_title = function() end,
+      close = function()
+        entry.closed = true
+      end,
+      set_title = function(_, title)
+        entry.titles[#entry.titles + 1] = title
+      end,
+      set_footer = function(_, footer)
+        entry.footers[#entry.footers + 1] = footer
+      end,
     },
   },
   nil
@@ -173,7 +202,9 @@ local function reset()
   inputs = {}
   fake_http.routes = {}
   fake_http.requests = {}
+  fake_http.handles = {}
   fake_http.jar = {}
+  fake_http.jar_error = nil
   fake_qr.shown = {}
   scripted_input = { "1234" }
   fake_timer.queue = {}
@@ -379,6 +410,91 @@ describe("auth.login", function()
     truthy(notified("无法打开微信读书登录页"))
     falsy(auth.is_logged_in())
   end)
+  it("keeps the dialog open on expiry and refreshes the code with r", function()
+    reset()
+    fake_http.expect("/r/weread-skills", { { body = "ok" }, { body = "ok" } })
+    fake_http.expect("/api/auth/getLoginUid", { { body = { uid = "uid-old" } }, { body = { uid = "uid-new" } } })
+    fake_http.expect("/api/auth/getLoginInfo", { { body = { logicCode = "LOGIN_TIMEOUT" } }, { body = LOGIN_OK } })
+    fake_http.expect("/api/userInfo", { { body = { name = "refreshed" } } })
+    fake_http.expect("/api/skills/apikeyGet", { { body = { apikey = "wrk-new" } } })
+
+    auth.login()
+    drain()
+
+    local first = fake_qr.shown[1]
+    truthy(notified("按 r 刷新"), "the expiry points at the refresh key")
+    matches(first.footers[#first.footers], "二维码已过期")
+    falsy(auth.is_logged_in())
+
+    first.opts.actions.r()
+    drain()
+
+    eq(#fake_qr.shown, 2, "a second QR code")
+    eq(fake_qr.shown[2].text, "https://weread.qq.com/web/confirm?uid=uid-new")
+    truthy(auth.is_logged_in(), "the refreshed code logged in")
+  end)
+
+  it("closes an expired dialog without calling it a cancel", function()
+    reset()
+    fake_http.expect("/r/weread-skills", { { body = "ok" } })
+    fake_http.expect("/api/auth/getLoginUid", { { body = { uid = "uid-x" } } })
+    fake_http.expect("/api/auth/getLoginInfo", { { body = { logicCode = "LOGIN_TIMEOUT" } } })
+
+    auth.login()
+    drain()
+    fake_qr.shown[1].opts.on_close()
+
+    falsy(notified("已取消登录"))
+  end)
+
+  it("copies the confirm link with y", function()
+    reset()
+    fake_http.expect("/r/weread-skills", { { body = "ok" } })
+    fake_http.expect("/api/auth/getLoginUid", { { body = { uid = "uid-copy" } } })
+
+    auth.login()
+    fake_qr.shown[1].opts.actions.y()
+
+    eq(vim.fn.getreg('"'), "https://weread.qq.com/web/confirm?uid=uid-copy")
+    truthy(notified("已复制登录链接"))
+    auth.cancel()
+  end)
+
+  it("shows a countdown and the keys in the footer", function()
+    reset()
+    fake_http.expect("/r/weread-skills", { { body = "ok" } })
+    fake_http.expect("/api/auth/getLoginUid", { { body = { uid = "uid-footer" } } })
+
+    auth.login()
+
+    local footers = fake_qr.shown[1].footers
+    truthy(#footers > 0, "a footer was drawn")
+    matches(footers[1], "等待扫码 [45]:%d%d")
+    matches(footers[1], "r 刷新")
+    auth.cancel()
+  end)
+
+  it("tells the user when the network keeps failing", function()
+    reset()
+    local refused = { status = 0, body = "" }
+    fake_http.expect("/r/weread-skills", { { body = "ok" } })
+    fake_http.expect("/api/auth/getLoginUid", { { body = { uid = "uid-net" } } })
+    fake_http.expect("/api/auth/getLoginInfo", { refused, refused, refused, { body = LOGIN_OK } })
+    fake_http.expect("/api/userInfo", { { body = { name = "n" } } })
+    fake_http.expect("/api/skills/apikeyGet", { { body = { apikey = "wrk-net" } } })
+
+    auth.login()
+    drain()
+
+    local saw = false
+    for _, footer in ipairs(fake_qr.shown[1].footers) do
+      if footer:find("网络异常", 1, true) then
+        saw = true
+      end
+    end
+    truthy(saw, "the footer reported the network")
+    truthy(auth.is_logged_in(), "polling carried on and succeeded")
+  end)
 end)
 
 describe("auth.apply_cookies", function()
@@ -434,5 +550,368 @@ describe("auth.logout", function()
     falsy(auth.is_logged_in())
     eq(#jar(), 0, "jar emptied")
     eq(vim.fn.filereadable(auth.credentials_path()), 0, "credentials removed")
+  end)
+end)
+
+-- ---------------------------------------------------------------- hardening
+-- (加固相关)
+
+local RENEWED = { code = 200, status = 200, body = '{"succ":1,"errCode":0}', headers = {} }
+
+---@param list string[]
+---@param needle string
+---@return boolean
+local function any_request(needle)
+  for _, request in ipairs(fake_http.requests) do
+    if request.url:find(needle, 1, true) then
+      return true
+    end
+  end
+  return false
+end
+
+describe("auth login when the cookie jar cannot be written", function()
+  it("fails the login with the reason instead of hanging on the finishing dialog", function()
+    reset()
+    fake_http.expect("/r/weread-skills", { { body = "ok" } })
+    fake_http.expect("/api/auth/getLoginUid", { { body = { uid = "uid-jar" } } })
+    fake_http.expect("/api/auth/getLoginInfo", { { body = LOGIN_OK } })
+    fake_http.jar_error = "disk full"
+
+    auth.login()
+    drain()
+
+    truthy(notified("登录凭据写入失败"), "the failure is reported")
+    truthy(notified("disk full"), "with its reason")
+    truthy(fake_qr.shown[1].closed, "the dialog was closed, not left on 正在完成登录")
+    falsy(any_request("/api/userInfo"), "nothing was requested with a stale jar")
+    falsy(any_request("/api/skills/apikeyGet"))
+    falsy(auth.is_logged_in())
+    eq(credentials(), nil)
+  end)
+
+  it("also copes with a jar write that raises", function()
+    reset()
+    fake_http.expect("/r/weread-skills", { { body = "ok" } })
+    fake_http.expect("/api/auth/getLoginUid", { { body = { uid = "uid-jar2" } } })
+    fake_http.expect("/api/auth/getLoginInfo", { { body = LOGIN_OK } })
+    local original = fake_http.set_cookies
+    fake_http.set_cookies = function()
+      error("boom")
+    end
+
+    local ok = pcall(function()
+      auth.login()
+      drain()
+    end)
+    fake_http.set_cookies = original
+
+    truthy(ok, "the login flow did not blow up")
+    truthy(notified("登录凭据写入失败"))
+    truthy(notified("boom"))
+    truthy(fake_qr.shown[1].closed)
+  end)
+
+  it("save_credentials raises when the jar cannot be written", function()
+    reset()
+    fake_http.jar_error = "read-only file system"
+    local ok, err = pcall(auth.save_credentials, {
+      version = 1,
+      api_key = "k",
+      cookies = { wr_vid = "v", wr_skey = "s", wr_ql = "0", wr_rt = "r" },
+    })
+    falsy(ok)
+    matches(err, "read%-only file system")
+  end)
+
+  it("logout still removes the credentials when the jar cannot be emptied", function()
+    reset()
+    auth.save_credentials({
+      version = 1,
+      api_key = "k",
+      cookies = { wr_vid = "v", wr_skey = "s", wr_ql = "0", wr_rt = "r" },
+    })
+    fake_http.jar_error = "disk full"
+    local ok = pcall(auth.logout)
+    truthy(ok, "logout does not raise")
+    eq(vim.fn.filereadable(auth.credentials_path()), 0)
+    falsy(auth.is_logged_in())
+  end)
+end)
+
+describe("auth credentials on disk", function()
+  local function stale_backups()
+    local found = {}
+    for name in vim.fs.dir(tmpdir) do
+      if name:find("credentials.json.corrupt-", 1, true) then
+        found[#found + 1] = tmpdir .. "/" .. name
+      end
+    end
+    return found
+  end
+
+  local function remove_backups()
+    for _, path in ipairs(stale_backups()) do
+      vim.fn.delete(path)
+    end
+  end
+
+  it("writes atomically with mode 0600 and leaves no temp file", function()
+    reset()
+    auth.save_credentials({
+      version = 1,
+      api_key = "k",
+      cookies = { wr_vid = "v", wr_skey = "s", wr_ql = "0", wr_rt = "r" },
+    })
+    eq(vim.fn.getfperm(auth.credentials_path()), "rw-------")
+    for name in vim.fs.dir(tmpdir) do
+      falsy(name:find("credentials.json.tmp", 1, true), "stray temp file " .. name)
+    end
+  end)
+
+  it("keeps the old credentials when the write fails", function()
+    if vim.env.USER == "root" then
+      return -- root ignores directory permissions(root 不受目录权限约束)
+    end
+    reset()
+    local original = {
+      version = 1,
+      api_key = "old-key",
+      cookies = { wr_vid = "v", wr_skey = "s", wr_ql = "0", wr_rt = "r" },
+    }
+    auth.save_credentials(original)
+
+    -- ensure_dirs adjusts the data directory's permissions; keep it out of the
+    -- way so the read-only directory is what the write actually meets.
+    -- (ensure_dirs 会调整数据目录的权限；让它别插手，写入遇到的才是那个只读目录)
+    local ensure_dirs = config.ensure_dirs
+    config.ensure_dirs = function()
+      return tmpdir
+    end
+    vim.uv.fs_chmod(tmpdir, 360) -- 0550
+    local ok, err = pcall(auth.save_credentials, vim.tbl_extend("force", original, { api_key = "new-key" }))
+    vim.uv.fs_chmod(tmpdir, 493) -- 0755
+    config.ensure_dirs = ensure_dirs
+
+    falsy(ok)
+    matches(err, "could not write credentials")
+    eq(credentials().api_key, "old-key", "the file on disk is the old one")
+  end)
+
+  it("warns once and keeps a backup when the file is corrupt", function()
+    reset()
+    remove_backups()
+    vim.fn.writefile({ "{this is not json" }, auth.credentials_path())
+
+    eq(auth.load_credentials(), nil)
+    falsy(auth.is_logged_in())
+    truthy(notified("登录文件损坏"), "the user is told")
+    truthy(notified(".corrupt-"), "and where the backup went")
+    truthy(notified("重新登录"))
+    eq(vim.uv.fs_stat(auth.credentials_path()), nil, "the bad file is out of the way")
+    eq(#stale_backups(), 1)
+
+    local count = #notifications
+    auth.load_credentials()
+    auth.is_logged_in()
+    eq(#notifications, count, "no second warning")
+    remove_backups()
+  end)
+
+  it("treats valid JSON that is not an object as corrupt too", function()
+    reset()
+    remove_backups()
+    vim.fn.writefile({ "null" }, auth.credentials_path())
+    eq(auth.load_credentials(), nil)
+    truthy(notified("登录文件损坏"))
+    remove_backups()
+  end)
+
+  it("stays quiet when there is simply no credentials file", function()
+    reset()
+    eq(auth.load_credentials(), nil)
+    falsy(notified("登录文件损坏"))
+    eq(#notifications, 0)
+  end)
+end)
+
+describe("auth.renew is single-flight", function()
+  it("sends one request for concurrent callers and answers all of them", function()
+    reset()
+    fake_http.expect("/web/login/renewal", { "hold" })
+    local answers = {}
+    for index = 1, 3 do
+      auth.renew(function(ok, err)
+        answers[index] = { ok = ok, err = err }
+      end)
+    end
+
+    local renewals = 0
+    for _, request in ipairs(fake_http.requests) do
+      if request.url:find("/web/login/renewal", 1, true) then
+        renewals = renewals + 1
+      end
+    end
+    eq(renewals, 1, "three callers, one request")
+    eq(#answers, 0, "nobody has an answer yet")
+
+    fake_http.handles[1].release(RENEWED)
+
+    eq(#answers, 3, "all three were answered together")
+    for index = 1, 3 do
+      eq(answers[index].ok, true)
+    end
+    truthy(auth.last_renewed_at() > 0, "the success is recorded")
+  end)
+
+  it("starts a fresh renewal once the previous one is done", function()
+    reset()
+    fake_http.expect("/web/login/renewal", { RENEWED, RENEWED })
+    auth.renew()
+    auth.renew()
+    local renewals = 0
+    for _, request in ipairs(fake_http.requests) do
+      if request.url:find("/web/login/renewal", 1, true) then
+        renewals = renewals + 1
+      end
+    end
+    eq(renewals, 2)
+  end)
+
+  it("passes a failure to every waiter and records no renewal", function()
+    reset()
+    fake_http.expect("/web/login/renewal", { "hold", RENEWED })
+    local answers = {}
+    for index = 1, 2 do
+      auth.renew(function(ok, err)
+        answers[index] = { ok = ok, err = err }
+      end)
+    end
+    fake_http.handles[1].release({ code = 0, status = nil, error = "refused", headers = {} })
+
+    eq(#answers, 2)
+    eq(answers[1].ok, false)
+    eq(answers[2].ok, false)
+    matches(answers[1].err, "续期请求失败")
+    eq(auth.last_renewed_at(), 0, "a failure is not a renewal")
+
+    local again
+    auth.renew(function(ok)
+      again = ok
+    end)
+    eq(again, true, "and the next call is not stuck behind the failed one")
+  end)
+
+  it("does not stay wedged when the request raises before calling back", function()
+    reset()
+    fake_http.expect("/web/login/renewal", { { raise = "spawn exploded" }, RENEWED })
+    local first
+    auth.renew(function(ok, err)
+      first = { ok = ok, err = err }
+    end)
+    eq(first.ok, false)
+    matches(first.err, "spawn exploded")
+
+    local second
+    auth.renew(function(ok)
+      second = ok
+    end)
+    eq(second, true, "the next renewal goes through")
+  end)
+
+  it("lets one failing waiter not strand the others", function()
+    reset()
+    fake_http.expect("/web/login/renewal", { "hold" })
+    local last
+    auth.renew(function()
+      error("waiter blew up")
+    end)
+    auth.renew(function(ok)
+      last = ok
+    end)
+    fake_http.handles[1].release(RENEWED)
+    eq(last, true)
+  end)
+
+  it("mirrors the refreshed cookies into credentials.json", function()
+    reset()
+    auth.save_credentials({
+      version = 1,
+      api_key = "k",
+      cookies = { wr_vid = "v", wr_skey = "old-skey", wr_ql = "0", wr_rt = "r" },
+    })
+    -- what curl would have persisted into the jar(curl 会写进 jar 的内容)
+    fake_http.jar = {
+      { name = "wr_skey", value = "new-skey", domain = ".weread.qq.com", path = "/", expires = 0 },
+    }
+    fake_http.expect("/web/login/renewal", { RENEWED })
+    local result
+    auth.renew(function(ok)
+      result = ok
+    end)
+    eq(result, true)
+    eq(credentials().cookies.wr_skey, "new-skey")
+    eq(vim.fn.getfperm(auth.credentials_path()), "rw-------")
+  end)
+end)
+
+describe("auth.cancel aborts the login long poll", function()
+  it("kills the poll in flight and ignores its late answer", function()
+    reset()
+    fake_http.expect("/r/weread-skills", { { body = "ok" } })
+    fake_http.expect("/api/auth/getLoginUid", { { body = { uid = "uid-cancel" } } })
+    fake_http.expect("/api/auth/getLoginInfo", { "hold" })
+    fake_http.expect("/api/userInfo", { { body = { name = "must-not-happen" } } })
+
+    auth.login()
+    drain()
+    local poll = fake_http.handles[#fake_http.handles]
+    falsy(poll.killed, "the poll is running")
+
+    auth.cancel()
+    truthy(poll.killed, "cancel aborted the poll")
+
+    poll.release({ code = 200, status = 200, body = vim.json.encode(LOGIN_OK), headers = {} })
+    falsy(any_request("/api/userInfo"), "the late success changed nothing")
+    falsy(auth.is_logged_in())
+    eq(credentials(), nil)
+  end)
+
+  it("does not touch requests that are not the poll", function()
+    reset()
+    fake_http.expect("/r/weread-skills", { { body = "ok" } })
+    fake_http.expect("/api/auth/getLoginUid", { { body = { uid = "uid-cancel2" } } })
+    auth.login()
+    auth.cancel()
+    for _, handle in ipairs(fake_http.handles) do
+      falsy(handle.killed)
+    end
+  end)
+
+  it("a new login replaces the old poll", function()
+    reset()
+    fake_http.expect("/r/weread-skills", { { body = "ok" }, { body = "ok" } })
+    fake_http.expect("/api/auth/getLoginUid", { { body = { uid = "uid-a" } }, { body = { uid = "uid-b" } } })
+    fake_http.expect("/api/auth/getLoginInfo", { "hold", "hold" })
+    auth.login()
+    drain()
+    local first = fake_http.handles[#fake_http.handles]
+    auth.login()
+    truthy(first.killed, "starting over cancels the previous attempt's poll")
+  end)
+end)
+
+describe("auth service root", function()
+  it("is built from config.web_origin, trailing slash and all", function()
+    config.setup({ data_dir = tmpdir, base_url = "https://example.test/" })
+    eq(auth.skills_url(), "https://example.test/r/weread-skills")
+    eq(auth.renewal_url(), "https://example.test/web/login/renewal")
+    config.setup({ data_dir = tmpdir })
+    eq(auth.skills_url(), "https://weread.qq.com/r/weread-skills")
+  end)
+
+  it("no longer carries the unused change listeners and header helper", function()
+    eq(auth.on_change, nil)
+    eq(auth.api_headers, nil)
   end)
 end)

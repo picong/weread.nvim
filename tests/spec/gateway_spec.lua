@@ -263,6 +263,12 @@ package.loaded["weread.ui"] = setmetatable({
 }, { __index = real_ui })
 
 describe("reader pickers", function()
+  -- `weread.reader` captures the ui module at load time, so a copy loaded by an
+  -- earlier spec would keep the real picker and block on stdin. Drop it and let
+  -- it pick up the stub above.
+  -- (weread.reader 在加载时就抓住了 ui 模块，因此更早的 spec 加载过的副本会继续用真选择器，
+  --  卡在标准输入上。丢掉它，让它去拿上面的桩)
+  package.loaded["weread.reader"] = nil
   local reader = require("weread.reader")
 
   ---@param runner fun()
@@ -308,5 +314,42 @@ describe("reader pickers", function()
     matches(captured.title, "三体")
     eq(#captured.items, 1)
     truthy(captured.items[1].text:find("刘慈欣", 1, true))
+  end)
+end)
+
+describe("api_gateway default endpoint", function()
+  it("falls back to the configured default instead of a second literal", function()
+    local config_mod = require("weread.config")
+    local previous = config_mod.get().gateway_url
+    config_mod.get().gateway_url = ""
+    local url = require("weread.api_gateway").gateway_url()
+    config_mod.get().gateway_url = previous
+    eq(url, config_mod.defaults.gateway_url .. "/api/agent/gateway")
+  end)
+
+  it("keeps the api key out of the curl command line", function()
+    local original = vim.system
+    local argv
+    vim.system = function(args, _, on_exit)
+      argv = vim.deepcopy(args)
+      on_exit({ code = 0, stdout = "200", stderr = "" })
+      return { kill = function() end }
+    end
+    local ok = pcall(function()
+      local done = false
+      require("weread.http").request({
+        url = "https://example.invalid/api/agent/gateway",
+        headers = { Authorization = "Bearer wrk-test-cmdline" },
+        retries = 0,
+      }, function()
+        done = true
+      end)
+      vim.wait(2000, function()
+        return done
+      end, 10)
+    end)
+    vim.system = original
+    truthy(ok)
+    falsy(table.concat(argv, "\n"):find("wrk-test-cmdline", 1, true), "the bearer token must not appear in argv")
   end)
 end)

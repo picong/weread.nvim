@@ -16,6 +16,13 @@ local tmpdir = "/tmp/weread-test-qr"
 vim.fn.delete(tmpdir, "rf")
 vim.fn.mkdir(tmpdir, "p")
 
+-- `qr.show` without an explicit `png` writes <data_dir>/tmp/login-qr.png; point the
+-- data dir at the sandbox so a run never touches the reader's real data directory.
+-- (不传 png 时 qr.show 会写 <data_dir>/tmp/login-qr.png；把数据目录指进沙箱，
+--  测试就不会碰读者真实的数据目录)
+require("weread.config").setup({ data_dir = tmpdir .. "/data" })
+vim.fn.mkdir(tmpdir .. "/data/tmp", "p")
+
 local URL = "https://weread.qq.com/web/confirm?uid=test-uid"
 
 ---Close the floating window a dialog opened, if any.
@@ -67,6 +74,38 @@ describe("qr.encode_ascii", function()
   end)
 end)
 
+describe("qr.render", function()
+  local matrix = assert(qr.matrix(URL))
+
+  it("reads a square module matrix", function()
+    eq(#matrix, #matrix[1], "square")
+    -- a finder pattern sits in the top left corner (左上角是定位图案)
+    truthy(matrix[1][1] and matrix[1][7] and matrix[7][1])
+    falsy(matrix[2][2])
+  end)
+
+  it("packs two module rows into one line with half blocks", function()
+    local lines, highlights = qr.render(matrix, { margin = 2, ambiwidth = "single" })
+    eq(#lines, math.ceil((#matrix + 4) / 2))
+    eq(vim.api.nvim_strwidth(lines[1]), #matrix + 4)
+    eq(#highlights, #lines, "one highlight per line")
+    eq(highlights[1][4], "WereadQr")
+  end)
+
+  it("paints spaces when half blocks would be double width", function()
+    local lines, highlights = qr.render(matrix, { margin = 2, ambiwidth = "double" })
+    eq(#lines, #matrix + 4)
+    eq(lines[1], string.rep(" ", (#matrix + 4) * 2))
+    local dark = 0
+    for _, mark in ipairs(highlights) do
+      if mark[4] == "WereadQrDark" then
+        dark = dark + 1
+      end
+    end
+    truthy(dark > #matrix, "dark runs are painted")
+  end)
+end)
+
 describe("qr.show", function()
   it("renders the QR as an image when the terminal supports it", function()
     -- Pretend to be kitty and stub the renderer, which is the only part that
@@ -106,6 +145,34 @@ describe("qr.show", function()
     package.loaded["snacks.image.buf"] = nil
   end)
 
+  it("sizes the float from the PNG's real pixel shape", function()
+    -- A QR code is square, and terminal cells are about twice as tall as wide, so
+    -- the height is half the width plus the border row. That only comes out right
+    -- if the PNG header was actually read (via image.pixel_size).
+    -- (二维码是正方形，终端单元格高约为宽的两倍，所以高度是宽度的一半加边框一行；
+    --  只有真的读到了 PNG 头（经 image.pixel_size）才会得到这个值)
+    local image = require("weread.image")
+    local real_supports = image.supports_inline
+    image.supports_inline = function()
+      return true
+    end
+    package.loaded["snacks.image.buf"] = {
+      attach = function() end,
+    }
+
+    local dialog, err = qr.show(URL, { png = tmpdir .. "/sized.png", width = 20 })
+    truthy(dialog, tostring(err))
+    eq(dialog.mode, "image")
+    local pixel_width, pixel_height = image.pixel_size(tmpdir .. "/sized.png")
+    eq(pixel_width, pixel_height, "qrencode writes a square")
+    eq(dialog.float.width, 20)
+    eq(dialog.float.height, 11, "20 * 1 * 0.5 + 1")
+
+    close(dialog)
+    image.supports_inline = real_supports
+    package.loaded["snacks.image.buf"] = nil
+  end)
+
   it("falls back to ASCII when the renderer fails", function()
     local image = require("weread.image")
     local real_supports = image.supports_inline
@@ -120,10 +187,11 @@ describe("qr.show", function()
 
     local dialog, err = qr.show(URL)
     truthy(dialog, tostring(err))
-    eq(dialog.mode, "ascii", "degraded instead of crashing")
+    eq(dialog.mode, "text", "degraded instead of crashing")
 
     local lines = vim.api.nvim_buf_get_lines(dialog.float:get_buf(), 0, -1, false)
-    truthy(#lines > 5, "the ASCII code is there")
+    truthy(#lines > 5, "the text code is there")
+    eq(dialog.float.height, #lines, "the window fits the code exactly")
 
     close(dialog)
     image.supports_inline = real_supports
@@ -139,7 +207,25 @@ describe("qr.show", function()
 
     local dialog, err = qr.show(URL)
     truthy(dialog, tostring(err))
-    eq(dialog.mode, "ascii")
+    eq(dialog.mode, "text")
+
+    local fired = false
+    dialog = (function()
+      close(dialog)
+      return qr.show(URL, {
+        footer = " 等待扫码 ",
+        actions = {
+          r = function()
+            fired = true
+          end,
+        },
+      })
+    end)()
+    local config = vim.api.nvim_win_get_config(dialog.float:get_win())
+    matches(vim.inspect(config.footer), "等待扫码")
+    vim.api.nvim_set_current_win(dialog.float:get_win())
+    vim.api.nvim_feedkeys("r", "x", false)
+    truthy(fired, "the caller action is mapped")
 
     close(dialog)
     image.supports_inline = real_supports
