@@ -121,7 +121,7 @@ describe("inline.render_headings", function()
     local marks = marks_of(buf)
     local span, conceal = nil, nil
     for _, mark in ipairs(marks) do
-      if mark[4].hl_group == "WereadHeading" then
+      if mark[4].hl_group == "WereadHeading1" then
         span = mark
       elseif mark[4].conceal ~= nil then
         conceal = mark
@@ -195,10 +195,13 @@ describe("inline.attach", function()
       end
     end
 
-    truthy(groups.Bold, "bold span")
-    truthy(groups.Italic, "italic span")
-    truthy(groups.Underline, "underline span")
-    truthy(groups.Strikethrough, "strike span")
+    -- The palette's own groups, not the built-in Bold/Italic: those carry no
+    -- colour, so a colorscheme's syntax colours used to show through them.
+    -- (用配色自己的组，而不是内置的 Bold/Italic：那两组没有颜色，配色方案的语法颜色会透出来)
+    truthy(groups.WereadStrong, "bold span")
+    truthy(groups.WereadItalic, "italic span")
+    truthy(groups.WereadUnderline, "underline span")
+    truthy(groups.WereadStrike, "strike span")
 
     -- every drawn span must line up with a recorded span
     -- (每个画出来的区间都要与记录的样式吻合)
@@ -254,7 +257,7 @@ describe("inline.attach", function()
     inline.attach(buf, {}, { { line = 0, level = 2 } })
     local found = false
     for _, mark in ipairs(marks_of(buf)) do
-      if mark[4].hl_group == "WereadHeading" then
+      if mark[4].hl_group == "WereadHeading2" then
         found = true
       end
     end
@@ -270,6 +273,27 @@ describe("inline.attach", function()
     eq(inline.attach(buf, CONVERTED.styles), 0, "a wiped buffer is not an error")
   end)
 
+  it("dots CJK emphasis, skipping the punctuation", function()
+    local buf = vim.api.nvim_create_buf(false, true)
+    -- "**重要，必读**" : the bold span covers 重要，必读(粗体区间覆盖「重要，必读」)
+    local text = "**重要，必读** and **bold**"
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { text })
+    local cjk_from, cjk_to = 2, 2 + #"重要，必读"
+    local latin_from = text:find("bold", 1, true) - 1
+    inline.attach(buf, {
+      { line = 0, col_from = cjk_from, col_to = cjk_to, kind = "bold", markers = 2 },
+      { line = 0, col_from = latin_from, col_to = latin_from + 4, kind = "bold", markers = 2 },
+    })
+    local dots = {}
+    for _, mark in ipairs(marks_of(buf)) do
+      if mark[4].hl_group == "WereadEmphasisDots" then
+        dots[#dots + 1] = text:sub(mark[3] + 1, mark[4].end_col)
+      end
+    end
+    eq(dots, { "重要", "必读" }, "two runs, the comma left bare, nothing under Latin bold")
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+
   it("clears previous marks so a re-render cannot stack them", function()
     local buf = styled_buffer()
     inline.attach(buf, CONVERTED.styles)
@@ -283,10 +307,70 @@ describe("inline.attach", function()
     local buf = vim.api.nvim_create_buf(false, true)
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "只有一行" })
     local drawn = inline.attach(buf, {
-      { line = 99, col_from = 0, col_to = 3, kind = "bold", markers = 2 },
-      { line = 0, col_from = 2, col_to = 4, kind = "bold", markers = 2 },
+      { line = 99, col_from = 0, col_to = 3, kind = "italic", markers = 2 },
+      { line = 0, col_from = 2, col_to = 4, kind = "italic", markers = 2 },
     })
     eq(drawn, 1, "the out-of-range span is ignored")
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+end)
+
+describe("inline.conceal_structure", function()
+  it("names the language of a listing on the fence line", function()
+    -- render-markdown can name it too, but it puts the name on the empty line above
+    -- the fence, and an `overlay` virt_text is not drawn on an empty line — verified
+    -- against this neovim. So the page names it, on the fence's own line, which
+    -- carries the text an overlay needs.
+    -- (render-markdown 也会写语言名，但它把名字放在围栏上方的空行上，而 `overlay` 类虚拟文本
+    --  在空行上不会被绘制——已在本机 neovim 上实测。因此由书页自己写，写在围栏自己那一行上，
+    --  那一行带有叠加内容所需的文本)
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "```bash", "claude -p x", "```" })
+    inline.conceal_structure(buf)
+
+    local marks = vim.api.nvim_buf_get_extmarks(buf, vim.api.nvim_create_namespace("weread.inline"), 0, -1, { details = true })
+    local label = nil
+    for _, mark in ipairs(marks) do
+      local details = mark[4] or {}
+      if details.virt_text and details.virt_text[1] then
+        label = details.virt_text[1][1]
+      end
+    end
+    eq(label, "bash", "the language is on the page")
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+
+  it("hides code fences and table separator rows", function()
+    -- Both carry no text: the fence says "listing" to another reader of the file,
+    -- the separator is what makes the block a table. The page shows neither.
+    -- (两者都不是内容：围栏是给别的读者/工具看的「这是清单」，分隔行是让整块成为表格的前提。
+    --  页面上两者都不出现)
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
+      "正文",
+      "```",
+      "code()",
+      "```",
+      "| 维度| 用户界面|",
+      "| --- | --- |",
+      "| 交互模式| 终端 TUI|",
+      "| 只是带竖线的正文|",
+    })
+    eq(inline.conceal_structure(buf), 3, "two fences and the separator row")
+    local marks = marks_of(buf)
+    local concealed = 0
+    for _, mark in ipairs(marks) do
+      if mark[4].conceal ~= nil then
+        concealed = concealed + 1
+      end
+    end
+    eq(concealed, 3, "each one is concealed")
+    -- the prose line that merely contains a pipe is left alone
+    -- (只是含竖线的正文不受影响)
+    for _, mark in ipairs(marks) do
+      truthy(mark[1] ~= 7, "the last line must not be touched")
+      truthy(mark[1] ~= 0, "nor the first")
+    end
     vim.api.nvim_buf_delete(buf, { force = true })
   end)
 end)
@@ -297,5 +381,174 @@ describe("inline.from_meta", function()
     eq(inline.from_meta(nil), {})
     eq(inline.from_meta({}), {})
     eq(inline.from_meta({ styles = "nonsense" }), {})
+  end)
+end)
+
+describe("inline.render_lines", function()
+  ---@param marks table[]
+  ---@param line integer
+  ---@return table|nil
+  local function virt_text_on(marks, line)
+    for _, mark in ipairs(marks) do
+      local details = mark[4] or {}
+      if mark[2] == line and details.virt_text then
+        return details
+      end
+    end
+    return nil
+  end
+
+  it("centers a line with padding that is not part of the buffer", function()
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "居中标题", "左对齐正文" })
+    local drawn = inline.render_lines(buf, { [0] = { align = "center", cells = 8 } }, 52, "WereadMargin")
+    eq(drawn, 1, "only the centered line is padded")
+
+    local details = virt_text_on(marks_of(buf), 0)
+    truthy(details, "the line got virtual text")
+    eq(details.virt_text_pos, "inline")
+    eq(details.virt_text[1][1], string.rep(" ", 22), "(52 - 8) / 2")
+    eq(virt_text_on(marks_of(buf), 1), nil, "the body text is left alone")
+
+    -- and the buffer itself is untouched: highlights resolve to the same columns
+    -- (buffer 本身不动：划线解析出的列号因此不受影响)
+    eq(vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1], "居中标题")
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+
+  it("right aligns by padding to the margin", function()
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "——孔子" })
+    inline.render_lines(buf, { [0] = { align = "right", cells = 8 } }, 52, "WereadMargin")
+    eq(virt_text_on(marks_of(buf), 0).virt_text[1][1], string.rep(" ", 44))
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+
+  it("accepts the string keys a decoded map.json has", function()
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "——孔子" })
+    local drawn = inline.render_lines(buf, { ["0"] = { align = "right", cells = 6 } }, 40, "WereadMargin")
+    eq(drawn, 1, "JSON object keys arrive as strings")
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+
+  it("paints small print and the colour a book gave a block", function()
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "脚注", "提示 64" })
+    local drawn = inline.render_lines(buf, {
+      [0] = { small = true, cells = 4 },
+      [1] = { accent = true, cells = 7 },
+    }, 0, "WereadMargin")
+    eq(drawn, 2)
+    local groups = {}
+    for _, mark in ipairs(marks_of(buf)) do
+      groups[mark[2]] = (mark[4] or {}).hl_group
+    end
+    eq(groups[0], "WereadSmall")
+    eq(groups[1], "WereadHeading")
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+
+  it("does not pad without a page width", function()
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "标题" })
+    eq(inline.render_lines(buf, { [0] = { align = "center", cells = 4 } }, 0), 0)
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+end)
+
+describe("inline justification and footnotes", function()
+  it("draws the fill so a wrapped line reaches the page width on screen", function()
+    local result = xhtml.convert("<p>甲乙丙丁戊己庚辛壬癸子abcdefghijklmnop</p>", {
+      page_width = 26,
+      auto_space = true,
+      paragraph = { indent = "" },
+    })
+    truthy(result.lines[0] and result.lines[0].fill, "the first line is justified")
+
+    vim.o.columns = 80
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_set_current_buf(buf)
+    vim.wo.number = false
+    vim.wo.wrap = false
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(result.text, "\n", { plain = true }))
+    inline.render_lines(buf, vim.json.decode(vim.json.encode(xhtml.json_lines(result.lines))), 26, "WereadMargin")
+    vim.cmd("redraw!")
+
+    ---Cells row `row` spans on screen, from its first to its last character.
+    ---Measured from the text itself: whatever column gutter the window carries
+    ---comes before it.
+    ---(第 row 行在屏幕上从第一个到最后一个字符占多少格。从文本本身量起：窗口带的任何
+    --- 侧栏都在它之前)
+    local function row_width(row)
+      local first, last = nil, 0
+      for col = 1, vim.o.columns do
+        local cell = vim.fn.screenstring(row, col)
+        if cell ~= " " and cell ~= "" then
+          first = first or col
+          last = col + vim.fn.strdisplaywidth(cell) - 1
+        end
+      end
+      return first and (last - first + 1) or 0
+    end
+    eq(row_width(1), 26, "the justified row ends at the margin")
+    eq(row_width(2), 16, "the paragraph's last line is left ragged")
+    eq(vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1], "甲乙丙丁戊己庚辛壬癸子", "the buffer text is untouched")
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+
+  it("paints footnote marks", function()
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "正文[1]后文" })
+    local notes = { { line = 0, col_from = 6, col_to = 9, text = "注" }, { line = 5, col_from = 0, col_to = 3 } }
+    eq(inline.render_footnotes(buf, notes), 1, "the off-buffer entry is skipped")
+    local mark = marks_of(buf)[1]
+    eq(mark[4].hl_group, "WereadFootnote")
+    eq(mark[3], 6)
+    eq(mark[4].end_col, 9)
+
+    inline.attach(buf, {}, nil, nil, 0, notes)
+    local found = false
+    for _, each in ipairs(marks_of(buf)) do
+      found = found or each[4].hl_group == "WereadFootnote"
+    end
+    truthy(found, "attach draws them too")
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+
+  it("picks the heading group by level", function()
+    eq(inline.heading_group(1), "WereadHeading1")
+    eq(inline.heading_group(2), "WereadHeading2")
+    eq(inline.heading_group(3), "WereadHeading3")
+    eq(inline.heading_group(6), "WereadHeading3")
+    eq(inline.heading_group(nil), "WereadHeading1")
+  end)
+end)
+
+describe("weread.inline markdown structure", function()
+  it("draws a heading's icon, and blank room on the lines it wrapped onto", function()
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "## 甲甲", "## 乙乙", "正文" })
+    inline.render_headings(buf, { { line = 0, level = 2 }, { line = 1, level = 2, continued = true } })
+    local ns = vim.api.nvim_create_namespace("weread.inline")
+    local icons = {}
+    for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, ns, 0, -1, { details = true })) do
+      local virt = mark[4].virt_text
+      if virt then
+        icons[mark[2]] = virt[1][1]
+      end
+    end
+    eq(icons[0], inline.heading_icon(2), "the level's icon")
+    eq(vim.trim(icons[1]), "", "a continuation line keeps its text under the first")
+    eq(vim.fn.strdisplaywidth(icons[1]), vim.fn.strdisplaywidth(icons[0]))
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+
+  it("conceals the backslash of an escaped line start", function()
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "甲", "\\- 乙" })
+    eq(inline.render_escapes(buf, { { line = 1, col = 0 } }), 1)
+    eq(inline.render_escapes(buf, { { line = 0, col = 0 } }), 0, "only where a backslash is")
+    vim.api.nvim_buf_delete(buf, { force = true })
   end)
 end)

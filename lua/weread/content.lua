@@ -42,8 +42,6 @@ local M = {}
 -- Decoding
 -- =========================================================================
 
-local b64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-
 ---Verify the leading MD5 and return the payload.
 ---(校验前置 MD5 并返回载荷)
 ---@param response_text string
@@ -61,35 +59,32 @@ local function checked_body(response_text)
   return body
 end
 
+---Decode a (possibly URL-safe, possibly unpadded) base64 string.
+---(解码 base64，允许 URL-safe 字符集与缺失的 padding)
+---
+---Raises on input that is not base64. That is deliberate: callers wrap the
+---decode chain in `pcall`, and an empty string would sail through the later
+---UTF-8 check and get cached as a blank chapter.
+---(遇到非 base64 输入会抛错：调用方都用 pcall 包着解码链，而返回空串会骗过后面的
+--- UTF-8 检查，让一个空白章节被缓存下来)
+---@param data string
+---@return string
 local function base64_decode(data)
-  data = data:gsub("-", "+"):gsub("_", "/")
+  -- The old decoder dropped every byte outside the alphabet, whitespace included;
+  -- keep that tolerance for line breaks (the shard MD5 already vouches for the
+  -- payload, so this cannot hide corruption).
+  -- (旧解码器会丢弃字母表外的所有字节，包括空白；换行这一类继续容忍：分片的 MD5 已经
+  --  担保过内容完整，所以这里不会掩盖损坏)
+  data = (data:gsub("%s+", ""):gsub("%-", "+"):gsub("_", "/"))
   local pad = #data % 4
   if pad > 0 then
     data = data .. string.rep("=", 4 - pad)
   end
-  data = data:gsub("[^" .. b64chars .. "=]", "")
-  return (data:gsub(".", function(char)
-    if char == "=" then
-      return ""
-    end
-    local bits = ""
-    local index = b64chars:find(char, 1, true) - 1
-    for bit = 6, 1, -1 do
-      bits = bits .. (index % 2 ^ bit - index % 2 ^ (bit - 1) > 0 and "1" or "0")
-    end
-    return bits
-  end):gsub("%d%d%d?%d?%d?%d?%d?%d?", function(bits)
-    if #bits ~= 8 then
-      return ""
-    end
-    local byte = 0
-    for i = 1, 8 do
-      if bits:sub(i, i) == "1" then
-        byte = byte + 2 ^ (8 - i)
-      end
-    end
-    return string.char(byte)
-  end))
+  local ok, decoded = pcall(vim.base64.decode, data)
+  if not ok then
+    error("Shard is not valid base64: " .. tostring(decoded), 0)
+  end
+  return decoded
 end
 
 local function swap_positions(encoded)
@@ -174,6 +169,103 @@ function M.decode_shards(shards)
   return decode_encoded_body(body)
 end
 
+---Find the first byte that keeps `text` from being well-formed UTF-8, or, with
+---`opts.xml`, a C0 control character XML forbids (everything below 0x20 except
+---tab, newline and carriage return).
+---(找出让 text 不是合法 UTF-8 的第一个字节；带 opts.xml 时也找 XML 不允许的 C0
+--- 控制字符，即 0x20 以下除制表、换行、回车之外的字符)
+---
+---A shard spliced from two versions of a chapter, or decoded with one shard
+---missing, still passes every per-shard MD5, but the swap positions are taken
+---from the wrong total length: each swap leaves two garbage bytes behind. This
+---check is what catches that before anything is cached or shown.
+---(由两个版本拼成、或缺了一片的分片组合，每片 MD5 都校验通过，但 swap 位置是按错误的
+--- 总长度算的：每处 swap 都留下两个垃圾字节。这个检查负责在缓存或显示前把它拦下)
+---@param text string
+---@param opts table|nil { xml = boolean }
+---@return integer|nil position 1-based byte position of the first bad byte, nil when clean(首个坏字节的位置，干净时为 nil)
+function M.find_invalid_text(text, opts)
+  if type(text) ~= "string" then
+    return 1
+  end
+  local xml = opts and opts.xml
+  if xml then
+    local control = text:find("[%z\1-\8\11\12\14-\31]")
+    if control then
+      -- still report an earlier invalid byte, if there is one
+      -- (若前面还有非法字节，仍报更靠前的那个)
+      local before = M.find_invalid_text(text:sub(1, control - 1))
+      return before or control
+    end
+  end
+  -- fast path: pure ASCII (快速路径：纯 ASCII)
+  local i = text:find("[\128-\255]")
+  if not i then
+    return nil
+  end
+  local byte = string.byte
+  local length = #text
+  while i <= length do
+    local first = byte(text, i)
+    if first < 0x80 then
+      -- skip the ASCII run in one step (一次跳过整段 ASCII)
+      local next_high = text:find("[\128-\255]", i)
+      if not next_high then
+        return nil
+      end
+      i = next_high
+    else
+      local second = byte(text, i + 1)
+      local width
+      if first >= 0xc2 and first <= 0xdf then
+        width = 2
+      elseif first == 0xe0 then
+        width = (second and second >= 0xa0 and second <= 0xbf) and 3 or nil
+      elseif (first >= 0xe1 and first <= 0xec) or first == 0xee or first == 0xef then
+        width = 3
+      elseif first == 0xed then
+        -- no UTF-16 surrogates (不允许 UTF-16 代理项)
+        width = (second and second >= 0x80 and second <= 0x9f) and 3 or nil
+      elseif first == 0xf0 then
+        width = (second and second >= 0x90 and second <= 0xbf) and 4 or nil
+      elseif first >= 0xf1 and first <= 0xf3 then
+        width = 4
+      elseif first == 0xf4 then
+        width = (second and second >= 0x80 and second <= 0x8f) and 4 or nil
+      end
+      if not width then
+        return i
+      end
+      for offset = 1, width - 1 do
+        local continuation = byte(text, i + offset)
+        if not continuation or continuation < 0x80 or continuation > 0xbf then
+          return i
+        end
+      end
+      i = i + width
+    end
+  end
+  return nil
+end
+
+---Are the EPUB content shards three slices of one and the same payload? The
+---service cuts a chapter into near-equal thirds, so their lengths differ by the
+---remainder at most; a slice taken from another version of the chapter (one
+---the service was translating at that moment) has a clearly different length.
+---(EPUB 正文三片是否是同一份载荷切出来的？服务端把一章切成近似等长的三份，长度最多
+--- 差一个余数；若某片取自这一章的另一个版本（服务端那一刻正在翻译它），长度会明显不同)
+---@param shards string[]
+---@return boolean
+function M.shards_consistent(shards)
+  local shortest, longest = math.huge, 0
+  for _, shard in ipairs(shards) do
+    local length = #shard - 32
+    shortest = math.min(shortest, length)
+    longest = math.max(longest, length)
+  end
+  return longest - shortest <= 2
+end
+
 ---Wrap decoded TXT content into paragraph XHTML.
 ---(把解码后的 TXT 正文包成段落 XHTML)
 ---@param text string
@@ -194,9 +286,11 @@ end
 -- URLs and request shapes
 -- =========================================================================
 
+---Kept as a thin wrapper: progress.lua calls it, and config owns the origin.
+---(保留为薄封装：progress.lua 在调用它，origin 由 config 统一提供)
 ---@return string
 function M.base_url()
-  return config.get().base_url or "https://weread.qq.com"
+  return config.web_origin()
 end
 
 ---@param book_id string|number
@@ -387,6 +481,7 @@ local function classify_shard(body)
   end
   local ok, data = pcall(vim.json.decode, body)
   if not ok or type(data) ~= "table" then
+    log.debug("shard response starts with '{' but is not a JSON object: %s", tostring(body:sub(1, 80)))
     return "error", nil
   end
   if data.errCode then
@@ -400,10 +495,91 @@ local function classify_shard(body)
   return "error", data
 end
 
+---Why a shard response is not usable as a shard, or nil when it is.
+---(分片响应为什么不能当分片用；能用时返回 nil)
+---@param endpoint string
+---@param ok boolean
+---@param body string|nil
+---@return string|nil
+local function shard_problem(endpoint, ok, body)
+  if not ok then
+    return tostring(body)
+  end
+  if type(body) ~= "string" or body == "" then
+    return endpoint .. " 返回空内容"
+  end
+  if body:sub(1, 1) == "{" then
+    local decoded_ok, data = pcall(vim.json.decode, body)
+    local message = decoded_ok and require("weread.auth").describe_error(data) or nil
+    return endpoint .. " 返回错误：" .. (message or body:sub(1, 80))
+  end
+  return nil
+end
+
+---Decode a set of shards and refuse the result unless it is clean text.
+---(解码一组分片，结果不是干净文本就拒收)
+---@param shards string[]
+---@param opts table|nil { xml = boolean }
+---@return boolean ok
+---@return string text_or_error
+local function decode_checked(shards, opts)
+  local ok, text = pcall(M.decode_shards, shards)
+  if not ok then
+    return false, "章节解码失败：" .. tostring(text)
+  end
+  local bad = M.find_invalid_text(text, opts)
+  if bad then
+    return false, string.format("章节解码结果含非法字节（位置 %d），分片可能不完整或来自不同版本", bad)
+  end
+  return true, text
+end
+
+---Fetch shards in parallel and hand them back in order once all have answered.
+---(并行抓取多个分片，全部返回后按顺序交回)
+---@param book table
+---@param requests table[] { endpoint, opts }
+---@param callback fun(shards: string[]|nil, err: string|nil)
+local function fetch_all(book, requests, callback)
+  local results, problem = {}, nil
+  local pending = #requests
+  for index, request in ipairs(requests) do
+    M.fetch_shard(book, request[1], request[2], function(ok, body)
+      local issue = shard_problem(request[1], ok, body)
+      if issue then
+        problem = problem or issue
+      else
+        results[index] = body
+      end
+      pending = pending - 1
+      if pending == 0 then
+        if problem then
+          callback(nil, problem)
+        else
+          callback(results, nil)
+        end
+      end
+    end)
+  end
+end
+
+---How many times a chapter whose shards did not fit together is fetched again.
+---(分片对不上的章节最多重取几次)
+M.CHAPTER_RETRIES = 3
+
 ---Fetch and decode one chapter's XHTML and stylesheet.
 ---(抓取并解码一章的 XHTML 与样式表)
+---
+---Every shard has to arrive, and the decoded text has to be valid UTF-8 with no
+---control characters, or nothing is returned: a chapter is cached once and then
+---read from disk, so a garbled one would stay garbled. The usual cause is the
+---service re-cutting the chapter between two shard requests (while it
+---translates it), so the whole set is fetched again a few times before giving
+---up.
+---(所有分片都必须到齐，解码后必须是不含控制字符的合法 UTF-8，否则什么都不返回：章节
+--- 缓存一次之后就从磁盘读，一旦乱码就会一直乱码。常见原因是服务端在两次分片请求之间
+--- 重新切了这一章（正在翻译它），所以放弃前会整组重取几次)
 ---@param book table needs book_id, chapter_uid, psvts
----@param opts table|nil
+---@param opts table|nil { timeout, retries, retry_delay = ms }
 ---@param callback fun(ok: boolean, result: table|string)
 function M.fetch_chapter(book, opts, callback)
   if type(opts) == "function" then
@@ -412,89 +588,126 @@ function M.fetch_chapter(book, opts, callback)
   end
   opts = opts or {}
   local timeout = opts.timeout or 25
+  local retries = opts.retries or M.CHAPTER_RETRIES
+  local retry_delay = opts.retry_delay or 1500
+  local attempt = 0
 
-  M.fetch_shard(book, "/web/book/chapter/e_0", { timeout = timeout }, function(ok, first)
-    if not ok then
-      callback(false, first)
-      return
-    end
-
-    local kind, payload = classify_shard(first)
-    if kind == "error" then
-      local message = require("weread.auth").describe_error(payload) or "章节请求被拒绝"
-      callback(false, message)
-      return
-    end
-
-    -- TXT-format book: t_0/t_1 carry the plain text.
-    -- (TXT 型书籍：正文在 t_0/t_1)
-    if kind == "txt_metadata" then
-      M.fetch_shard(book, "/web/book/chapter/t_0", { timeout = timeout }, function(txt_ok, t0)
-        if not txt_ok then
-          callback(false, t0)
-          return
+  local function fetch_css(result)
+    M.fetch_shard(book, "/web/book/chapter/e_2", { timeout = timeout, style = true }, function(css_ok, css_shard)
+      if not shard_problem("/web/book/chapter/e_2", css_ok, css_shard) then
+        local ok_css, decoded = pcall(M.decode_shard, css_shard)
+        -- a damaged stylesheet only costs the styling (样式表坏了只损失样式)
+        if not ok_css then
+          log.warn("chapter %s: stylesheet shard did not decode, rendering without it: %s", tostring(book.chapter_uid), tostring(decoded))
+        elseif M.find_invalid_text(decoded) then
+          log.warn("chapter %s: stylesheet decoded to invalid text, rendering without it", tostring(book.chapter_uid))
+        else
+          result.css = decoded
         end
-        M.fetch_shard(book, "/web/book/chapter/t_1", { timeout = timeout, sc = 0 }, function(t1_ok, t1)
-          local shards = { t0 }
-          if t1_ok and t1 then
-            shards[#shards + 1] = t1
-          end
-          local decode_ok, text = pcall(M.decode_shards, shards)
-          if not decode_ok then
-            callback(false, "章节解码失败：" .. tostring(text))
+      end
+      callback(true, result)
+    end)
+  end
+
+  local run
+
+  ---Try again after a pause, or give up with the last reason.
+  ---(稍等再试，或带着最后的原因放弃)
+  local function retry(reason)
+    if attempt > retries then
+      log.warn("chapter %s/%s: giving up after %d attempts: %s", tostring(book.book_id), tostring(book.chapter_uid), attempt, reason)
+      callback(false, reason)
+      return
+    end
+    log.info("chapter %s/%s: %s; fetching again", tostring(book.book_id), tostring(book.chapter_uid), reason)
+    require("weread.timer").defer(run, retry_delay * attempt)
+  end
+
+  run = function()
+    attempt = attempt + 1
+    M.fetch_shard(book, "/web/book/chapter/e_0", { timeout = timeout }, function(ok, first)
+      if not ok then
+        callback(false, first)
+        return
+      end
+
+      local kind, payload = classify_shard(first)
+      if kind == "error" then
+        local message = require("weread.auth").describe_error(payload) or "章节请求被拒绝"
+        callback(false, message)
+        return
+      end
+
+      -- TXT-format book: t_0/t_1 carry the plain text.
+      -- (TXT 型书籍：正文在 t_0/t_1)
+      if kind == "txt_metadata" then
+        fetch_all(book, {
+          { "/web/book/chapter/t_0", { timeout = timeout } },
+        }, function(shards, err)
+          if not shards then
+            retry(err)
             return
           end
-          callback(true, { format = "txt", xhtml = M.txt_to_xhtml(text), css = nil })
+          -- t_1 may legitimately be empty (`{}`) for a short chapter, as
+          -- upstream allows; a transport failure or an error payload is not.
+          -- (短章节的 t_1 可以合法地为空（`{}`），上游也允许；但传输失败或错误负载不行)
+          M.fetch_shard(book, "/web/book/chapter/t_1", { timeout = timeout, sc = 0 }, function(t1_ok, t1)
+            if not t1_ok then
+              retry(tostring(t1))
+              return
+            end
+            if t1:sub(1, 1) == "{" then
+              local decoded_ok, data = pcall(vim.json.decode, t1)
+              local message = decoded_ok and require("weread.auth").describe_error(data) or nil
+              if message or not decoded_ok then
+                retry("/web/book/chapter/t_1 返回错误：" .. (message or t1:sub(1, 80)))
+                return
+              end
+            else
+              shards[2] = t1
+            end
+            local decode_ok, text = decode_checked(shards)
+            if not decode_ok then
+              retry(text)
+              return
+            end
+            callback(true, { format = "txt", xhtml = M.txt_to_xhtml(text), css = nil })
+          end)
         end)
-      end)
-      return
-    end
-
-    -- EPUB-format book: e_0 + e_1 + e_3 carry the XHTML, e_2 the stylesheet.
-    -- (EPUB 型书籍：正文在 e_0+e_1+e_3，样式表在 e_2)
-    local pending = 2
-    local shards = { first, "", "" }
-    local failed = nil
-
-    local function done()
-      pending = pending - 1
-      if pending > 0 then
-        return
-      end
-      if failed then
-        callback(false, failed)
-        return
-      end
-      local ok_decode, xhtml = pcall(M.decode_shards, shards)
-      if not ok_decode then
-        callback(false, "章节解码失败：" .. tostring(xhtml))
         return
       end
 
-      M.fetch_shard(book, "/web/book/chapter/e_2", { timeout = timeout, style = true }, function(css_ok, css_shard)
-        local css = nil
-        if css_ok and css_shard and css_shard:sub(1, 1) ~= "{" then
-          local ok_css, decoded = pcall(M.decode_shard, css_shard)
-          css = ok_css and decoded or nil
+      -- EPUB-format book: e_0 + e_1 + e_3 carry the XHTML, e_2 the stylesheet.
+      -- (EPUB 型书籍：正文在 e_0+e_1+e_3，样式表在 e_2)
+      fetch_all(book, {
+        { "/web/book/chapter/e_1", { timeout = timeout } },
+        { "/web/book/chapter/e_3", { timeout = timeout, sc = 0 } },
+      }, function(rest, err)
+        if not rest then
+          retry(err)
+          return
         end
-        callback(true, { format = "epub", xhtml = xhtml, css = css })
+        local shards = { first, rest[1], rest[2] }
+        if not M.shards_consistent(shards) then
+          retry(string.format(
+            "章节分片长度不一致（%d/%d/%d），服务端可能正在更新本章",
+            #first - 32,
+            #rest[1] - 32,
+            #rest[2] - 32
+          ))
+          return
+        end
+        local decode_ok, xhtml = decode_checked(shards, { xml = true })
+        if not decode_ok then
+          retry(xhtml)
+          return
+        end
+        fetch_css({ format = "epub", xhtml = xhtml, css = nil })
       end)
-    end
-
-    M.fetch_shard(book, "/web/book/chapter/e_1", { timeout = timeout }, function(ok1, shard1)
-      if ok1 and shard1 and shard1:sub(1, 1) ~= "{" then
-        shards[2] = shard1
-      end
-      done()
     end)
+  end
 
-    M.fetch_shard(book, "/web/book/chapter/e_3", { timeout = timeout, sc = 0 }, function(ok3, shard3)
-      if ok3 and shard3 and shard3:sub(1, 1) ~= "{" then
-        shards[3] = shard3
-      end
-      done()
-    end)
-  end)
+  run()
 end
 
 -- =========================================================================
@@ -529,6 +742,10 @@ function M.extract_images(entries)
   return images
 end
 
+---Resource tarballs downloaded so far, numbering their temporary files.
+---(已下载的资源包数，用来给临时文件编号)
+local tar_downloads = 0
+
 ---Download and unpack a chapter's resource tarball.
 ---(下载并解包章节资源包)
 ---@param book table
@@ -541,12 +758,25 @@ function M.fetch_assets(book, chapter, callback)
   end
 
   config.ensure_dirs()
-  local tar_path = string.format("%s/tmp/chapter-%s-%s.tar", config.data_dir(), tostring(book.book_id), tostring(chapter.chapterUid))
+  -- unique per download: a reload can start one while the last is still running
+  -- (每次下载唯一：重载时上一次可能还在跑)
+  tar_downloads = tar_downloads + 1
+  local tar_path = string.format(
+    "%s/tmp/chapter-%s-%s-%d-%d.tar",
+    config.data_dir(),
+    tostring(book.book_id),
+    tostring(chapter.chapterUid),
+    vim.uv.os_getpid(),
+    tar_downloads
+  )
   http.download(chapter.tar, tar_path, {
     referer = M.reader_url(book.book_id, book.chapter_uid),
     timeout = 60,
     retries = 2,
   }, function(res)
+    -- the downloader keeps its header dump next to the body; drop it on every path
+    -- (下载器会把响应头留在正文旁边；无论成败都删掉)
+    os.remove(tar_path .. ".headers")
     if res.code ~= 200 and res.status ~= 200 then
       os.remove(tar_path)
       callback(false, string.format("资源包下载失败（HTTP %s）", tostring(res.status or res.error)))

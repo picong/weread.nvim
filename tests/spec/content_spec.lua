@@ -54,6 +54,62 @@ describe("content.decode_shard", function()
   end)
 end)
 
+describe("content.decode_shard base64 handling", function()
+  ---Wrap a base64 string into a valid shard: MD5 header, one filler byte, and
+  ---the swap the decoder undoes (for 4..10 chars it swaps 1<->3 and 2<->4).
+  ---(把 base64 串包成合法分片：MD5 头、一个填充字节，以及解码器要还原的换位)
+  ---@param encoded string
+  ---@return string
+  local function shard_of(encoded)
+    local chars = vim.split(encoded, "")
+    if #chars >= 4 and #chars < 11 then
+      chars[1], chars[3] = chars[3], chars[1]
+      chars[2], chars[4] = chars[4], chars[2]
+    end
+    local body = "x" .. table.concat(chars)
+    return require("weread.crypto").md5_hex(body):upper() .. body
+  end
+
+  it("decodes padded input", function()
+    eq(content.decode_shard(shard_of("QUJDRA==")), "ABCD")
+  end)
+
+  it("restores a missing padding", function()
+    eq(content.decode_shard(shard_of("QUJDRA")), "ABCD")
+    eq(content.decode_shard(shard_of("QUJDREU")), "ABCDE")
+  end)
+
+  it("accepts the URL-safe alphabet", function()
+    local raw = "\251\255\254"
+    local standard = vim.base64.encode(raw)
+    eq(standard, "+//+", "the bytes really exercise + and /")
+    local url_safe = standard:gsub("%+", "-"):gsub("/", "_")
+    eq(url_safe, "-__-")
+    eq(content.decode_shard(shard_of(url_safe)), raw)
+  end)
+
+  it("ignores line breaks and spaces like the old decoder did", function()
+    eq(content.decode_shard(shard_of("QUJD\nRA==")), "ABCD")
+    eq(content.decode_shard(shard_of("QUJD RA\r\n")), "ABCD")
+  end)
+
+  it("raises on input that is not base64 instead of returning garbage", function()
+    raises(function()
+      content.decode_shard(shard_of("@@@@"))
+    end, "base64")
+    -- a length that no amount of padding can repair (补多少 padding 也救不回来的长度)
+    raises(function()
+      content.decode_shard(shard_of("QUJDR"))
+    end, "base64")
+  end)
+
+  it("keeps the failure inside the caller's pcall", function()
+    local ok, err = pcall(content.decode_shards, { shard_of("@@@@") })
+    falsy(ok)
+    matches(err, "base64")
+  end)
+end)
+
 describe("content.reader_url", function()
   it("matches the ported protocol implementation", function()
     for _, case in ipairs({
@@ -206,5 +262,118 @@ describe("content.check_response", function()
     end)
     truthy(fine)
     eq(captured, nil)
+  end)
+end)
+
+describe("content.find_invalid_text", function()
+  it("accepts clean UTF-8 of every width", function()
+    eq(content.find_invalid_text(""), nil)
+    eq(content.find_invalid_text("plain ascii\n\ttab"), nil)
+    eq(content.find_invalid_text("é — 中文《书》 😀"), nil)
+    eq(content.find_invalid_text(shards.xhtml.plain, { xml = true }), nil)
+    eq(content.find_invalid_text(shards.chinese.plain), nil)
+  end)
+
+  it("points at the first byte that is not UTF-8", function()
+    -- the very bytes a spliced chapter came out with (拼错分片的章节实际解出的字节)
+    eq(content.find_invalid_text('<span clas{\219"p">'), 12)
+    eq(content.find_invalid_text("ab\136\240an"), 3)
+    eq(content.find_invalid_text("中\228\184"), 4, "truncated sequence")
+    eq(content.find_invalid_text("\192\128"), 1, "overlong encoding")
+    eq(content.find_invalid_text("\237\160\128"), 1, "UTF-16 surrogate")
+    eq(content.find_invalid_text("\244\144\128\128"), 1, "beyond U+10FFFF")
+  end)
+
+  it("flags control characters only when asked to check XML", function()
+    eq(content.find_invalid_text('class="c1\28'), nil)
+    eq(content.find_invalid_text('class="c1\28', { xml = true }), 10)
+    eq(content.find_invalid_text("a\0b", { xml = true }), 2)
+    eq(content.find_invalid_text("a\r\n\tb", { xml = true }), nil)
+  end)
+end)
+
+describe("content.shards_consistent", function()
+  it("accepts the near-equal thirds the service cuts", function()
+    truthy(content.shards_consistent(shards.xhtml.shards))
+  end)
+
+  it("rejects a shard taken from another version of the chapter", function()
+    local mixed = vim.deepcopy(shards.xhtml.shards)
+    mixed[2] = mixed[2] .. string.rep("A", 40)
+    falsy(content.shards_consistent(mixed))
+  end)
+end)
+
+describe("content.fetch_assets leftovers", function()
+  local config = require("weread.config")
+  local http = require("weread.http")
+  local mock_lib = dofile(vim.fn.getcwd() .. "/tests/mock.lua")
+
+  -- Read once on the main loop: route handlers run in a libuv callback (在主循环里读一次)
+  local tar_bytes = mock_lib.fixture_bytes("images.tar")
+
+  local tmpdir = vim.fn.tempname()
+  vim.fn.mkdir(tmpdir, "p")
+
+  ---@param dir string
+  ---@return string[]
+  local function headers_left_in(dir)
+    local found = {}
+    for name in vim.fs.dir(dir) do
+      if name:find("%.headers$") then
+        found[#found + 1] = name
+      end
+    end
+    return found
+  end
+
+  ---@param chapter table
+  ---@return boolean ok
+  ---@return table|string result
+  local function fetch(mock, chapter)
+    config.setup({ data_dir = tmpdir, base_url = mock.url, proxy = "direct" })
+    config.ensure_dirs()
+    http.setup({ jar = config.path("cookies.txt"), tmpdir = config.path("tmp"), timeout = 8, retries = 0, proxy = "direct" })
+    local done, ok, result = false, nil, nil
+    content.fetch_assets({ book_id = "1", chapter_uid = "2" }, chapter, function(cb_ok, cb_result)
+      ok, result, done = cb_ok, cb_result, true
+    end)
+    vim.wait(15000, function()
+      return done
+    end, 20)
+    truthy(done, "the callback fired")
+    return ok, result
+  end
+
+  it("removes the .headers file after a successful download", function()
+    local mock = mock_lib.start({
+      {
+        path = "/wrco/tar_ok",
+        handler = function()
+          return { status = 200, ctype = "application/octet-stream", body = tar_bytes }
+        end,
+      },
+    })
+    local ok, result = fetch(mock, { chapterUid = 2, tar = mock.url .. "/wrco/tar_ok" })
+    mock.stop()
+    truthy(ok, tostring(result))
+    eq(#result.images, 2)
+    eq(headers_left_in(config.path("tmp")), {}, "no chapter-*.tar.headers left behind")
+  end)
+
+  it("removes the .headers file after a failed download too", function()
+    local mock = mock_lib.start({
+      {
+        path = "/wrco/tar_gone",
+        handler = function()
+          return { status = 404, ctype = "text/plain", body = "gone" }
+        end,
+      },
+    })
+    local ok, result = fetch(mock, { chapterUid = 3, tar = mock.url .. "/wrco/tar_gone" })
+    mock.stop()
+    falsy(ok)
+    matches(result, "资源包下载失败")
+    eq(headers_left_in(config.path("tmp")), {}, "nor after a failure")
   end)
 end)

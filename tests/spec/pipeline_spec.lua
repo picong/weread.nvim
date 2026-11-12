@@ -225,6 +225,62 @@ describe("content pipeline against a mock server", function()
     eq(#leftovers, 0, "no leftover tarballs")
   end)
 
+  ---Serve the chapter with a custom e_1 route, on a mock of its own.
+  ---(用自己的 mock 提供章节，e_1 路由自定义)
+  local function with_e1(handler, runner)
+    local routes = mock_lib.weread_routes(ref)
+    for _, route in ipairs(routes) do
+      if route.path == "/web/book/chapter/e_1" then
+        route.handler = handler
+      end
+    end
+    local custom = start_mock(routes)
+    local previous = config.get().base_url
+    config.setup({ data_dir = tmpdir, base_url = custom.url, proxy = "direct" })
+    local results = { runner() }
+    config.setup({ data_dir = tmpdir, base_url = previous, proxy = "direct" })
+    custom.stop()
+    return unpack_values(results)
+  end
+
+  it("fetches the chapter again when a shard comes from another version of it", function()
+    -- While the service translates a chapter, one shard request can be answered
+    -- from the old cut and the next from the new one. Each passes its MD5, but
+    -- decoded together they leave garbage bytes all over the chapter.
+    -- (服务端翻译某章时，一次分片请求可能按旧版切、下一次按新版切；每片 MD5 都对，但
+    --  合在一起解码会在全章留下垃圾字节)
+    local served = 0
+    local ok, result = with_e1(function()
+      served = served + 1
+      local body = served == 1 and shards.chinese.shards[1] or shards.xhtml.shards[2]
+      return { status = 200, ctype = "text/plain", body = body }
+    end, function()
+      local book = { book_id = BOOK_ID, chapter_uid = "2", psvts = "9a1b2c3d4e5f60718293a4b5c6d7e8f0" }
+      return await(function(cb)
+        content.fetch_chapter(book, { retry_delay = 10 }, cb)
+      end, 20000)
+    end)
+    truthy(ok, tostring(result))
+    eq(served, 2, "the whole set was fetched a second time")
+    eq(result.xhtml, shards.xhtml.plain, "and decoded cleanly")
+  end)
+
+  it("fails rather than decode a chapter with a shard missing", function()
+    local served = 0
+    local ok, message = with_e1(function()
+      served = served + 1
+      return { status = 200, ctype = "application/json", body = '{"errcode":-10102,"errmsg":"Hit api rate limit."}' }
+    end, function()
+      local book = { book_id = BOOK_ID, chapter_uid = "2", psvts = "9a1b2c3d4e5f60718293a4b5c6d7e8f0" }
+      return await(function(cb)
+        content.fetch_chapter(book, { retries = 1, retry_delay = 10 }, cb)
+      end, 20000)
+    end)
+    falsy(ok, "a chapter with a hole in it is never returned")
+    matches(message, "rate limit")
+    eq(served, 2, "tried again once before giving up")
+  end)
+
   it("maps a WeRead error payload into an actionable message", function()
     local failing = start_mock({
       {

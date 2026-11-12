@@ -55,6 +55,18 @@ function ReaderState.extract(html, json_decode)
     token = reader.token or html:match([["token"%s*:%s*"([^"]+)"]]),
     current_chapter = current_chapter,
     progress = progress_book,
+    -- `otherType` lists the alternative renderings the service has for the book;
+    -- one carrying `translateStatus` is the machine translation the reader offers.
+    -- (`otherType` 列出服务端为这本书准备的其它呈现方式；带 `translateStatus` 的那项就是阅读器
+    --  提供的机器翻译)
+    translatable = (function()
+      for _, other in ipairs(type(book_info.otherType) == "table" and book_info.otherType or {}) do
+        if type(other) == "table" and other.translateStatus ~= nil and other.showType then
+          return true
+        end
+      end
+      return false
+    end)(),
   }
 end
 

@@ -22,8 +22,122 @@ local M = {}
 ---@field underline? boolean
 ---@field strike? boolean
 ---@field mark? boolean
+---Block level properties. These carry *values* rather than flags, because the
+---renderer needs the number, not only the fact that the property was set.
+---(块级属性。这些带**值**而不是标志位，因为渲染器需要那个数字，而不只是「设置了」)
+---@field align? string "left"|"center"|"right"|"justify"
+---@field size? number relative font size, 1 = body text(相对字号，1 = 正文)
+---@field color? string colour as written, normalized to lowercase(原样保留的颜色)
+---@field indent? number text-indent in em(首行缩进的 em 值)
+---@field padding_left? number
+---@field padding_right? number
 
 local WEIGHT_BOLD = { bold = true, bolder = true, ["600"] = true, ["700"] = true, ["800"] = true, ["900"] = true }
+
+---Named sizes books use for footnotes, captions and quotes.
+---(书里给小字（脚注、图注、引文）用的具名字号)
+local NAMED_SMALL = { small = 0.8, smaller = 0.8, ["x-small"] = 0.8, ["xx-small"] = 0.8 }
+
+---Class name fragments that imply block level layout even without a stylesheet.
+---(没有样式表时也能从类名推断的块级排版，用于「类名自解释」的书)
+local BLOCK_NAME_HINTS = {
+  { pattern = "center", key = "align", value = "center" },
+  { pattern = "centered", key = "align", value = "center" },
+  { pattern = "text%-right", key = "align", value = "right" },
+  { pattern = "footnote", key = "size", value = 0.8 },
+  { pattern = "small", key = "size", value = 0.8 },
+  { pattern = "caption", key = "size", value = 0.8 },
+  -- `picture_figure_title` is the real WeRead name for a figure caption
+  -- (picture_figure_title 是微信读书图注的真实类名)
+  { pattern = "figure_title", key = "size", value = 0.8 },
+}
+
+---Values that mean "no colour" or a colour indistinguishable from ink.
+---(表示「没有颜色」或者与墨色无异的颜色)
+local NEUTRAL_COLORS = {
+  transparent = true,
+  inherit = true,
+  initial = true,
+  currentcolor = true,
+  black = true,
+  white = true,
+  gray = true,
+  grey = true,
+  silver = true,
+}
+
+---Parse a CSS length into a relative number. `em`/`%` are the only units a book
+---uses for indentation and relative font size; `px`/`pt` are dropped because
+---they are meaningless without the base size.
+---(把 CSS 长度解析成相对数值。书里表示缩进与相对字号的单位只有 em/%，px/pt 因为没有
+--- 基数字号而被丢弃)
+---@param value string|nil
+---@return number|nil
+local function relative_length(value)
+  local text = tostring(value or ""):gsub("%s*!important%s*$", ""):gsub("^%s+", ""):gsub("%s+$", "")
+  local percent = text:match("^(%-?%d*%.?%d+)%%$")
+  if percent then
+    return tonumber(percent) / 100
+  end
+  local em = text:match("^(%-?%d*%.?%d+)em$")
+  if em then
+    return tonumber(em)
+  end
+  local bare = text:match("^(%-?%d*%.?%d+)$")
+  if bare then
+    return tonumber(bare)
+  end
+  return nil
+end
+
+---Chroma of a colour: how far it is from grey. Anything below this is ink.
+---(颜色的彩度：离灰有多远。低于这个值就当作墨色)
+local CHROMA_THRESHOLD = 24
+
+---@param value string|nil
+---@return integer r, integer g, integer b
+local function to_rgb(value)
+  local text = tostring(value or ""):lower()
+  local hex = text:match("^#(%x%x%x%x%x%x)$")
+  if hex then
+    return tonumber(hex:sub(1, 2), 16), tonumber(hex:sub(3, 4), 16), tonumber(hex:sub(5, 6), 16)
+  end
+  local short = text:match("^#(%x%x%x)$")
+  if short then
+    local r, g, b = short:sub(1, 1), short:sub(2, 2), short:sub(3, 3)
+    return tonumber(r .. r, 16), tonumber(g .. g, 16), tonumber(b .. b, 16)
+  end
+  local r, g, b = text:match("^rgba?%(%s*(%d+)%s*,%s*(%d+)%s*,%s*(%d+)")
+  if r then
+    return tonumber(r), tonumber(g), tonumber(b)
+  end
+  return 0, 0, 0
+end
+
+---Is this colour far enough from grey to be worth drawing?
+---(这个颜色离灰足够远、值得画出来吗？)
+---
+---A book paints section titles orange and body text near black; only the
+---former is a signal. Treating `#000` and `#c36500` alike is what used to make
+---every title look like ordinary text.
+---(书里把节标题染成橙色、正文接近黑色，只有前者是有效信号。把 `#000` 和 `#c36500`
+--- 一视同仁，正是标题看起来和正文毫无区别的原因)
+---@param value string|nil
+---@return boolean
+function M.is_neutral_color(value)
+  local text = tostring(value or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+  if text == "" or NEUTRAL_COLORS[text] then
+    return true
+  end
+  if not text:find("#", 1, true) and not text:find("rgb", 1, true) then
+    -- a named colour we did not list: assume it is a real colour
+    -- (没列出来的具名颜色：当作真彩色)
+    return false
+  end
+  local r, g, b = to_rgb(text)
+  local high, low = math.max(r, g, b), math.min(r, g, b)
+  return (high - low) < CHROMA_THRESHOLD
+end
 
 ---Names that imply styling even without a stylesheet, which covers books whose
 ---classes are self documenting (`bold`, `italic`, `fw-bold`, `u`, ...).
@@ -77,6 +191,60 @@ function M.from_declarations(declarations)
       if significant and alpha ~= 0 then
         style.mark = true
       end
+    elseif property == "text-align" then
+      -- `justify` is what a book sets on its body text; only the two that can
+      -- actually move text in a terminal are kept.
+      -- (书里正文普遍是 justify；只有终端真能移动文本的两种值得保留)
+      local align = value:gsub("%s*!important%s*$", "")
+      if align == "center" or align == "right" or align == "left" or align == "justify" then
+        style.align = align
+      end
+    elseif property == "font-size" then
+      local size = NAMED_SMALL[value] or relative_length(value)
+      -- 1em is the body text: recording it would only add noise
+      -- (1em 就是正文，记下来只会添噪音)
+      if size and size ~= 1 then
+        style.size = size
+      end
+    elseif property == "color" then
+      local color = value:gsub("%s*!important%s*$", "")
+      if color ~= "" and not NEUTRAL_COLORS[color] then
+        style.color = color
+      end
+    elseif property == "text-indent" then
+      local indent = relative_length(value)
+      if indent then
+        style.indent = indent
+      end
+    elseif property == "padding" then
+      -- shorthand: 1 value = all sides, 2/3 = the second is horizontal, 4 = the
+      -- fourth is left. Only the horizontal padding matters to typesetting.
+      -- (简写：1 个值=四边，2/3 个值=第二个是水平方向，4 个值=第四个是左。排版只关心水平方向)
+      local values = {}
+      for piece in value:gmatch("[^%s]+") do
+        values[#values + 1] = piece
+      end
+      local left = values[1]
+      if #values >= 4 then
+        left = values[4]
+      elseif #values >= 2 then
+        left = values[2]
+      end
+      local parsed = relative_length(left)
+      if parsed then
+        style.padding_left = parsed
+        style.padding_right = parsed
+      end
+    elseif property == "padding-left" then
+      local pad = relative_length(value)
+      if pad then
+        style.padding_left = pad
+      end
+    elseif property == "padding-right" then
+      local pad = relative_length(value)
+      if pad then
+        style.padding_right = pad
+      end
     end
   end
   return style
@@ -84,6 +252,10 @@ end
 
 ---Merge two styles; the second wins.
 ---(合并两个样式，后者优先)
+---
+---Values are copied as they are, not collapsed to `true`: `align = "center"`
+---has to survive the merge, and it is consulted as a string further down.
+---(值原样拷贝，不压成 `true`：`align = "center"` 必须活过合并，后续是按字符串用的)
 ---@param base weread.css.Style|nil
 ---@param extra weread.css.Style|nil
 ---@return weread.css.Style
@@ -91,8 +263,8 @@ function M.merge(base, extra)
   local merged = {}
   for _, source in ipairs({ base or {}, extra or {} }) do
     for key, value in pairs(source) do
-      if value then
-        merged[key] = true
+      if value ~= nil and value ~= false then
+        merged[key] = value
       end
     end
   end
@@ -111,7 +283,8 @@ end
 ---@return weread.css.Style
 function M.from_class_name(class)
   local style = {}
-  for token in tostring(class or ""):lower():gmatch("[%w_%-]+") do
+  local lowered = tostring(class or ""):lower()
+  for token in lowered:gmatch("[%w_%-]+") do
     local hint = NAME_HINTS[token]
     if not hint then
       -- also match `fw-bold`, `text-italic`, ... but not `bolder-texture`
@@ -125,6 +298,17 @@ function M.from_class_name(class)
     end
     if hint then
       style[hint] = true
+    end
+  end
+
+  -- Block level layout by name, used only when the stylesheet says nothing
+  -- about the class. `content_center` and `footnote_content` are real WeRead
+  -- names; books without a stylesheet still get their centering and small print.
+  -- (类名推断的块级排版，只在样式表没提到这个类时使用。content_center 与
+  --  footnote_content 是微信读书真实用到的类名；没有样式表的书也能保住居中与小字)
+  for _, rule in ipairs(BLOCK_NAME_HINTS) do
+    if lowered:find(rule.pattern) then
+      style[rule.key] = style[rule.key] or rule.value
     end
   end
   return style
