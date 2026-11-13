@@ -436,6 +436,19 @@ describe("auth.login", function()
     eq(credentials(), nil)
   end)
 
+  it("treats a bare HTTP 401 as an expired QR too", function()
+    reset()
+    fake_http.expect("/r/weread-skills", { { body = "ok" } })
+    fake_http.expect("/api/auth/getLoginUid", { { body = { uid = "uid-401" } } })
+    fake_http.expect("/api/auth/getLoginInfo", { { status = 401, body = "<html>login err</html>" } })
+
+    auth.login()
+    drain()
+
+    truthy(notified("二维码已过期"))
+    eq(credentials(), nil)
+  end)
+
   it("runs the handshake in a private jar instead of the logged-in account", function()
     reset()
     fake_http.jar = {

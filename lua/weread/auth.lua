@@ -737,6 +737,13 @@ function M._poll(session, otp)
     end
     local data = http.decode_json(res)
     if not data then
+      -- A bare 401 has no JSON to inspect, but it still means the uid is gone.
+      -- (裸 401 没有 JSON 可检查，但它同样说明 uid 已失效)
+      if res.status == 401 then
+        log.warn("login poll unauthorized (HTTP 401)")
+        expire(session)
+        return
+      end
       -- Nothing happened yet: curl gives up on the long poll and we try again.
       -- (还没有人扫码：curl 结束长轮询后重新发起)
       log.debug("login poll pending (%s)", tostring(res.error or res.status))
