@@ -65,7 +65,7 @@ function M.call(api_name, params, opts, callback)
   local auth = require("weread.auth")
   local key = auth.api_key()
   if not key then
-    callback(false, "缺少官方 API Key，请执行 :WeReadLogin 重新扫码登录")
+    callback(false, "缺少官方 API Key：请在微信读书 App 开通微信读书 Skill 后重新执行 :WeReadLogin")
     return
   end
 

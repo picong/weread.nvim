@@ -8,11 +8,15 @@ Protocol notes, all of them verified against the live service:
 * `GET /r/weread-skills` bootstraps an anonymous session.
 * `GET /api/auth/getLoginUid` returns `{uid}`; the QR payload is
   `https://weread.qq.com/web/confirm?uid=<uid>`.
-* `GET /api/auth/getLoginInfo?uid=&otp=` long-polls. It answers with
-  `{succeed:true, webLoginVid, accessToken, refreshToken}` once the phone
-  confirms, `{logicCode:"NEED_OTP"}` when the phone shows a four digit code,
-  `OTP_NOT_MATCH` / `OTP_EXPIRED` / `LOGIN_TIMEOUT` for the other outcomes,
-  and simply times out while nothing has happened yet.
+* `GET /api/auth/getLoginInfo?uid=&otp=` long-polls (the web client holds it
+  for 60s). It answers with `{succeed:true, webLoginVid, accessToken,
+  refreshToken}` once the phone confirms, `{logicCode:"NEED_OTP"}` when the
+  phone shows a four digit code, `OTP_NOT_MATCH` / `OTP_EXPIRED` /
+  `LOGIN_TIMEOUT` for the other outcomes, and simply times out while nothing
+  has happened yet. `succeed` has also been seen as a number, and a complete
+  credential pair is treated as success even if the flag is missing.
+* The login handshake runs in a private cookie jar; the account that is still
+  logged in must not take part in confirming the new one.
 * Credentials are returned in the JSON body, **not** in Set-Cookie headers, so
   the jar has to be written by hand.
 * `/api/*` calls authenticate with the `X-Vid` + `X-Skey` headers.
@@ -72,10 +76,23 @@ function M.renewal_url()
   return base() .. "/web/login/renewal"
 end
 
----Long poll budget in seconds. A curl timeout here is the normal idle state,
----not an error, which is why the poll runs without retries.
----(长轮询超时；curl 超时在这里代表“还没扫码”，是正常状态，因此轮询不做重试)
-local POLL_TIMEOUT = 8
+---Path of the cookie jar used only by the QR login handshake. Keeping it
+---separate from the shared jar means an account switch cannot be disturbed by
+---the cookies of the account that is still logged in.
+---(扫码登录握手专用的 cookie jar。它与共享 jar 分开，切换账号时不会被仍在登录的
+--- 旧账号 cookie 干扰)
+---@return string
+function M.login_jar_path()
+  return config.path("tmp/login-cookies.txt")
+end
+
+---Long poll budget in seconds. The web client holds this request for 60s, and a
+---shorter abort can throw away a success or an OTP verification that arrived
+---just as curl gave up. A timeout is still the normal idle state, so the poll
+---runs without retries and simply starts another one.
+---(长轮询超时。网页端会把这个请求挂 60 秒；中止得太早会在 curl 放弃的瞬间丢掉已经
+--- 到达的成功或验证码校验结果。超时依然代表“还没扫码”，所以轮询不重试，直接再发一次)
+local POLL_TIMEOUT = 60
 local POLL_INTERVAL_MS = 1500
 local SESSION_TIMEOUT = 300
 -- Consecutive failed polls that are not plain long-poll timeouts before the
@@ -158,10 +175,11 @@ end
 ---(写 jar，不管 http 层以哪种方式报告失败：抛异常、`nil, err` 或 `false, err`；单个 `nil`
 --- 视为成功（旧调用方什么也不返回）)
 ---@param list table[]
+---@param path string|nil defaults to the shared jar(默认共享 jar)
 ---@return boolean ok
 ---@return string|nil err
-local function store_cookies(list)
-  local called, ok, err = pcall(http.set_cookies, list)
+local function store_cookies(list, path)
+  local called, ok, err = pcall(http.set_cookies, list, path)
   if not called then
     return false, tostring(ok)
   end
@@ -392,6 +410,9 @@ local function new_session()
   local session = {
     generation = state.generation,
     started = os.time(),
+    -- Monotonic deadline: a wall clock step (NTP, timezone change) must not make
+    -- a fresh QR look expired. (单调时钟截止时间：系统时钟跳变不能把新二维码判成过期)
+    deadline = nil,
     dialog = nil,
     uid = nil,
     payload = nil,
@@ -399,7 +420,13 @@ local function new_session()
     ticker = nil,
     status = "等待扫码",
     expired = false,
+    finished = false,
     failures = 0,
+    -- The code the reader already typed, kept across long-poll retries. Dropping
+    -- it made a delayed verification look like the phone had never answered.
+    -- (读者已经输入的验证码；跨长轮询重试保留。丢掉它会让延迟的校验看起来像手机没应答)
+    otp = nil,
+    login_jar = nil,
   }
   state.session = session
   return session
@@ -424,7 +451,11 @@ end
 ---@param session table
 ---@return integer seconds left before the QR code expires
 local function remaining(session)
-  return math.max(0, SESSION_TIMEOUT - (os.time() - session.started))
+  if not session.deadline then
+    return SESSION_TIMEOUT
+  end
+  local left = math.floor((session.deadline - vim.uv.hrtime()) / 1e9)
+  return math.max(0, left)
 end
 
 ---Redraw the dialog footer: status, countdown and the keys, dropping the key
@@ -467,34 +498,57 @@ local function close_dialog(session)
   stop_timer(session)
   stop_ticker(session)
   if session.dialog then
-    session.dialog.float:close()
+    -- The QR may be an image placement rather than the buffer text; closing the
+    -- window alone can leave those pixels on screen until something redraws.
+    -- (二维码可能是图片 placement 而不是 buffer 文本；只关窗口会让那些像素留在屏幕上，
+    --  直到下一次重绘)
+    if session.dialog.cleanup then
+      pcall(session.dialog.cleanup)
+    end
+    if session.dialog.float and session.dialog.float:is_open() then
+      session.dialog.float:close()
+    end
     session.dialog = nil
+  end
+end
+
+---Remove the private login jar once the attempt is over.
+---(尝试结束后删掉私有登录 jar)
+---@param session table
+local function cleanup_login_jar(session)
+  local path = session.login_jar
+  session.login_jar = nil
+  if path then
+    pcall(vim.uv.fs_unlink, path)
   end
 end
 
 ---@param session table
 ---@param message string
 ---@param is_error boolean|nil
-local function finish(session, message, is_error)
-  if session.generation ~= state.generation then
+---@param level integer|nil notification level for a successful finish(successful 时的通知级别)
+local function finish(session, message, is_error, level)
+  if session.generation ~= state.generation or session.finished then
     return
   end
   -- Detach first: closing the window fires on_close, which would otherwise
   -- report a user cancel on top of this message.
   -- (先解除关联：关窗会触发 on_close，否则会在本条消息之外再报一次“已取消”)
+  session.finished = true
   state.session = nil
   close_dialog(session)
+  cleanup_login_jar(session)
   if is_error then
     log.warn("login failed: %s", message)
-    notify(message, vim.log.levels.ERROR)
+    notify(message, level or vim.log.levels.ERROR)
   else
     log.info("login finished: %s", message)
-    notify(message)
+    notify(message, level)
   end
 end
 
 local function is_current(session)
-  return session.generation == state.generation
+  return session.generation == state.generation and not session.finished
 end
 
 ---The QR code ran out. The dialog stays open on purpose so `r` can fetch a
@@ -506,8 +560,17 @@ local function expire(session)
     return
   end
   session.expired = true
+  session.otp = nil
   stop_timer(session)
   stop_ticker(session)
+  -- A long poll still in flight must not report a result into a session that is
+  -- already over, and its curl should not keep the request open for a minute.
+  -- (已经过期的会话上还在跑的长轮询不能再把结果报进来，它的 curl 也不该继续挂一分钟)
+  local poll = session.poll
+  session.poll = nil
+  if poll and type(poll.kill) == "function" then
+    pcall(poll.kill)
+  end
   log.info("login QR expired")
   if session.dialog and session.dialog.float and session.dialog.float:is_open() then
     set_title(session, "二维码已过期 · 按 r 刷新")
@@ -556,12 +619,18 @@ local function ask_otp(session, message)
     return
   end
   stop_timer(session)
+  session.otp = nil
   set_status(session, "已扫码，输入验证码")
   set_title(session, "请输入手机上的 4 位验证码")
-  if message then
-    notify(message, vim.log.levels.WARN)
-  end
-  vim.ui.input({ prompt = "微信读书 4 位验证码: " }, function(input)
+  -- The app shows “scan succeeded” before we have a session; without this
+  -- notice the reader can keep watching the QR code and never notice the prompt.
+  -- (App 在我们拿到会话之前只显示“扫码成功”；不提示的话读者会一直盯着二维码，
+  --  根本不知道要输入验证码)
+  notify(
+    message or "已扫码，请在手机上查看 4 位验证码并输入到 Neovim",
+    vim.log.levels.WARN
+  )
+  local called, err = pcall(vim.ui.input, { prompt = "微信读书 4 位验证码: " }, function(input)
     if not is_current(session) then
       return
     end
@@ -574,9 +643,16 @@ local function ask_otp(session, message)
       ask_otp(session, "验证码必须是 4 位数字")
       return
     end
-    set_title(session, "正在校验验证码…")
-    M._poll(session, otp)
+    session.otp = otp
+    set_status(session, "正在验证验证码")
+    set_title(session, "正在验证验证码…")
+    M._poll(session)
   end)
+  if not called then
+    -- A broken UI must not leave the login stopped with a QR on screen.
+    -- (UI 出错不能让登录停在“只剩二维码”的状态)
+    finish(session, "无法打开验证码输入框：" .. tostring(err), true)
+  end
 end
 
 ---@param session table
@@ -587,12 +663,38 @@ local function handle_logic_code(session, code)
   elseif code == "OTP_NOT_MATCH" then
     ask_otp(session, "验证码不正确，请重试")
   elseif code == "OTP_EXPIRED" then
+    session.otp = nil
     finish(session, "验证码已过期，请重新执行 :WeReadLogin", true)
   elseif code == "LOGIN_TIMEOUT" then
+    session.otp = nil
     expire(session)
   else
+    session.otp = nil
     finish(session, "登录失败：" .. code, true)
   end
+end
+
+---Does this payload carry the credentials of a confirmed login?
+---(这个响应是否带着已确认登录的凭据？)
+---The service has returned `succeed` as a boolean and (on some backends) as a
+---number; checking only `== true` silently ignores both the number and an
+---otherwise complete payload. The web client only tests truthiness.
+---(服务返回的 `succeed` 见过布尔值，也见过数字；只判断 `== true` 会静默忽略数字，
+--- 以及一个字段已经齐全的响应。网页端只判断真值)
+---@param data table
+---@return boolean
+local function login_succeeded(data)
+  if type(data) ~= "table" then
+    return false
+  end
+  local flag = data.succeed
+  if flag == true or flag == 1 or flag == "1" or flag == "true" then
+    return true
+  end
+  return type(data.webLoginVid) == "string"
+    and data.webLoginVid ~= ""
+    and type(data.accessToken) == "string"
+    and data.accessToken ~= ""
 end
 
 ---Poll the login state once. Exposed for tests and for the timer callback.
@@ -603,12 +705,19 @@ function M._poll(session, otp)
   if not is_current(session) or session.expired then
     return
   end
-  if os.time() - session.started > SESSION_TIMEOUT then
+  if otp ~= nil then
+    session.otp = otp
+  end
+  if session.deadline and vim.uv.hrtime() >= session.deadline then
     expire(session)
     return
   end
 
-  local url = M.login_info_url() .. "?uid=" .. P.urlencode(session.uid) .. "&otp=" .. P.urlencode(otp or "")
+  local url = M.login_info_url()
+    .. "?uid="
+    .. P.urlencode(session.uid)
+    .. "&otp="
+    .. P.urlencode(session.otp or "")
   local settled = false
   local poll
   poll = http.request({
@@ -617,12 +726,13 @@ function M._poll(session, otp)
     timeout = POLL_TIMEOUT,
     retries = 0,
     persist = true,
+    cookie_jar = session.login_jar,
   }, function(res)
     settled = true
     if session.poll == poll then
       session.poll = nil
     end
-    if not is_current(session) then
+    if not is_current(session) or session.expired then
       return
     end
     local data = http.decode_json(res)
@@ -646,8 +756,29 @@ function M._poll(session, otp)
       return
     end
     session.failures = 0
-    if data.succeed == true then
+    if login_succeeded(data) then
       M._complete(session, data)
+      return
+    end
+    -- Error payloads used to be ignored here: `-2013 鉴权失败` has no
+    -- logicCode, so the poll kept spinning behind a QR that the service had
+    -- already retired. Treat an invalidated login session as expired.
+    -- (错误响应过去在这里被忽略：`-2013 鉴权失败` 没有 logicCode，轮询于是在一个
+    --  服务端已经作废的二维码后面空转。把失效的登录会话当作过期处理)
+    local detail = type(data.data) == "table" and data.data or data
+    local errcode = tonumber(detail.errcode or detail.errCode)
+    local errmsg = detail.errmsg or detail.errMsg or data.message
+    local status_code = tonumber(res.status) or tonumber(data.statusCode)
+    if errcode == -2012 or errcode == -2013 or status_code == 401 then
+      log.warn("login poll rejected: %s", tostring(errmsg or errcode or status_code))
+      expire(session)
+      return
+    end
+    if errcode or (status_code and status_code >= 400) then
+      log.warn("login poll failed: %s", tostring(errmsg or errcode or status_code))
+      session.failures = session.failures + 1
+      set_status(session, "登录服务异常，重试中")
+      schedule_poll(session)
       return
     end
     local code = tostring(data.logicCode or "")
@@ -685,7 +816,11 @@ function M._complete(session, login_result)
   set_status(session, "已确认")
   set_title(session, "正在完成登录…")
 
-  local jar = http.load_cookies()
+  -- Build the new jar from the login handshake, not from the account that may
+  -- still be logged in: cookies from the old account must not leak into the new
+  -- session. (用登录握手自己的 jar 构建新会话，而不是可能仍登录着的旧账号：旧账号的
+  --  cookie 不能漏进新会话)
+  local jar = http.load_cookies(session.login_jar)
   for _, name in ipairs(CREDENTIAL_COOKIES) do
     jar = cookies.remove(jar, name)
   end
@@ -701,8 +836,16 @@ function M._complete(session, login_result)
     cookies.upsert(jar, row)
   end
   -- Without the jar the follow-up requests are anonymous. Fail here, with the
-  -- reason, rather than leave the dialog on "正在完成登录…" forever.
-  -- (jar 没写进去，后续请求都是匿名的。在这里带着原因失败，而不是让对话框永远停在“正在完成登录…”)
+  -- reason, rather than leave the dialog on "正在完成登录…" forever. The shared
+  -- jar is replaced, not merged: cookies of the previous account must not
+  -- survive an account switch.
+  -- (jar 没写进去，后续请求都是匿名的。在这里带着原因失败，而不是让对话框永远停在
+  --  “正在完成登录…”；共享 jar 整体替换而不是合并，旧账号的 cookie 不能在切换后残留)
+  local private_stored, private_err = store_cookies(jar, session.login_jar)
+  if not private_stored then
+    finish(session, "登录凭据写入失败：" .. tostring(private_err), true)
+    return
+  end
   local stored, store_err = store_cookies(jar)
   if not stored then
     finish(session, "登录凭据写入失败：" .. tostring(store_err), true)
@@ -713,12 +856,55 @@ function M._complete(session, login_result)
     return { ["X-Vid"] = vid, ["X-Skey"] = skey }
   end
 
+  ---Save the confirmed account and close the dialog. A missing API key is not a
+  ---failed login: the cookie-authenticated reader works, and the shelf can be
+  ---enabled later by opening the Skill in the app.
+  ---(保存已确认账号并关闭对话框。缺少 API Key 不等于登录失败：cookie 鉴权的阅读器
+  --- 仍可用，之后在 App 开通 Skill 即可恢复书架)
+  ---@param name string
+  ---@param api_key string
+  local function save_and_finish(name, api_key)
+    local credentials = {
+      version = 1,
+      login_method = "qr",
+      login_time = os.time(),
+      account = { name = name, user_vid = vid },
+      api_key = api_key ~= "" and api_key or nil,
+      cookies = {
+        wr_vid = vid,
+        wr_skey = skey,
+        wr_ql = "0",
+        wr_rt = refresh ~= "" and P.urlencode(refresh) or "",
+      },
+    }
+    local ok, err = pcall(M.save_credentials, credentials)
+    if not ok then
+      finish(session, "凭据保存失败：" .. tostring(err), true)
+      return
+    end
+    local display = name ~= "" and name or "未知账号"
+    if api_key ~= "" then
+      finish(session, string.format("登录成功，账号：%s", display))
+    else
+      finish(
+        session,
+        string.format(
+          "登录成功，账号：%s（未获取到官方 API Key，书架/搜索不可用；请在「微信读书 App → 我 → 设置 → 微信读书 Skill」中开通后重新执行 :WeReadLogin）",
+          display
+        ),
+        false,
+        vim.log.levels.WARN
+      )
+    end
+  end
+
   -- 1) account name
   http.request({
     url = M.user_info_url() .. "?userVid=" .. P.urlencode(vid),
     referer = M.skills_url(),
     headers = api_headers(),
     persist = true,
+    cookie_jar = session.login_jar,
   }, function(user_res)
     if not is_current(session) then
       return
@@ -730,6 +916,7 @@ function M._complete(session, login_result)
     -- the freshly issued login.
     -- (官方 API Key；刚登录后服务端偶有延迟，故重试)
     local attempt = 0
+    local previous = M.load_credentials()
     local function fetch_key()
       attempt = attempt + 1
       http.request({
@@ -737,6 +924,7 @@ function M._complete(session, login_result)
         referer = M.skills_url(),
         headers = api_headers(),
         persist = true,
+        cookie_jar = session.login_jar,
       }, function(key_res)
         if not is_current(session) then
           return
@@ -748,41 +936,21 @@ function M._complete(session, login_result)
           return
         end
         if api_key == "" then
-          -- The jar already holds the new account; put the saved one back, or
-          -- page requests and the shelf would go to different accounts.
-          -- (jar 里已经是新账号了；换回已保存的那个，否则正文请求和书架会走两个不同的账号)
-          pcall(M.apply_cookies)
-          finish(
-            session,
-            "官方 API Key 获取失败。请先在「微信读书 App → 我 → 设置 → 微信读书 Skill」中开通并获取 API Key，再重新扫码。",
-            true
-          )
-          return
+          -- The same account may already have a key on disk; a transient
+          -- failure of this endpoint must not throw it away. A different
+          -- account must not inherit it.
+          -- (同一个账号可能已有落盘的 key；这个接口临时失败不能把它丢掉。换账号则不能继承)
+          if
+            previous
+            and previous.account
+            and previous.account.user_vid == vid
+            and type(previous.api_key) == "string"
+            and previous.api_key ~= ""
+          then
+            api_key = previous.api_key
+          end
         end
-
-        local credentials = {
-          version = 1,
-          login_method = "qr",
-          login_time = os.time(),
-          account = { name = name, user_vid = vid },
-          api_key = api_key,
-          cookies = {
-            wr_vid = vid,
-            wr_skey = skey,
-            wr_ql = "0",
-            wr_rt = refresh ~= "" and P.urlencode(refresh) or "",
-          },
-        }
-        local ok, err = pcall(M.save_credentials, credentials)
-        if not ok then
-          pcall(M.apply_cookies)
-          finish(session, "凭据保存失败：" .. tostring(err), true)
-          return
-        end
-
-        state.session = nil
-        close_dialog(session)
-        notify(string.format("登录成功，账号：%s", name ~= "" and name or "未知账号"))
+        save_and_finish(name, api_key)
       end)
     end
     fetch_key()
@@ -794,10 +962,32 @@ end
 ---@param opts table|nil
 function M.login(opts)
   opts = opts or {}
-  M.cancel()
+  -- `:WeReadLogin!` starts from a clean slate: stale cookies are a documented
+  -- cause of "登录超时", so the bang must actually clear them.
+  -- (`:WeReadLogin!` 从干净状态开始：残留 cookie 是官方文档记录的「登录超时」成因，
+  --  因此 bang 必须真的把它们清掉)
+  if opts.force and M.is_logged_in() then
+    -- The command layer may already have logged out when it saw the bang; only
+    -- clear again if credentials are actually still there.
+    -- (命令层看到 bang 时可能已经退出登录；只有凭据确实还在时才再清一次)
+    M.logout()
+  else
+    M.cancel()
+  end
 
   local session = new_session()
   log.info("login started")
+
+  -- A private jar for the handshake: the old account's cookies must not take
+  -- part in confirming the new one. (握手用私有 jar：旧账号的 cookie 不能参与新账号的确认)
+  config.ensure_dirs()
+  local login_jar = M.login_jar_path()
+  session.login_jar = login_jar
+  local cleared, clear_err = store_cookies({}, login_jar)
+  if not cleared then
+    finish(session, "无法创建登录会话：" .. tostring(clear_err), true)
+    return session
+  end
 
   session.dialog = nil
   notify("正在获取登录二维码…")
@@ -806,6 +996,7 @@ function M.login(opts)
     url = M.skills_url(),
     accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     persist = true,
+    cookie_jar = login_jar,
   }, function(page)
     if not is_current(session) then
       return
@@ -819,6 +1010,7 @@ function M.login(opts)
       url = M.login_uid_url(),
       referer = M.skills_url(),
       persist = true,
+      cookie_jar = login_jar,
     }, function(res)
       if not is_current(session) then
         return
@@ -833,6 +1025,7 @@ function M.login(opts)
       -- requests went out.
       -- (有效期从二维码上屏开始算，而不是从引导请求发出时算)
       session.started = os.time()
+      session.deadline = vim.uv.hrtime() + SESSION_TIMEOUT * 1e9
 
       local payload = base() .. "/web/confirm?uid=" .. P.urlencode(data.uid)
       session.payload = payload
@@ -898,6 +1091,7 @@ function M.cancel()
       pcall(poll.kill)
     end
     close_dialog(session)
+    cleanup_login_jar(session)
   end
 end
 
@@ -905,6 +1099,7 @@ end
 ---(完全清除本地账号数据)
 function M.logout()
   M.cancel()
+  pcall(vim.uv.fs_unlink, M.login_jar_path())
   local cleared, clear_err = store_cookies({})
   if not cleared then
     log.warn("logout: could not empty the cookie jar: %s", tostring(clear_err))

@@ -149,14 +149,17 @@ function M.user_agent()
 end
 
 ---Create an empty jar on first use so curl never complains about a missing
----file. A failure is logged and returned, not raised: this runs on every
----request, and curl copes with a missing jar anyway.
----(首次使用时创建空 jar，避免 curl 报文件不存在。失败时记日志并返回，不抛异常：
---- 每次请求都会走到这里，而 curl 本身能容忍 jar 不存在)
+---file. `path` lets the login handshake create its private jar too. A failure
+---is logged and returned, not raised: this runs on every request, and curl
+---copes with a missing jar anyway.
+---(首次使用时创建空 jar，避免 curl 报文件不存在。`path` 让登录握手也能创建自己的
+--- 私有 jar。失败时记日志并返回，不抛异常：每次请求都会走到这里，而 curl 本身能容忍
+--- jar 不存在)
+---@param path string|nil defaults to the shared jar(默认共享 jar)
 ---@return boolean|nil ok
 ---@return string|nil err
-function M.ensure_jar()
-  local path = M.jar_path()
+function M.ensure_jar(path)
+  path = path or M.jar_path()
   if vim.uv.fs_stat(path) then
     return true, nil
   end
@@ -168,10 +171,12 @@ function M.ensure_jar()
   return ok, err
 end
 
+---@param path string|nil defaults to the shared jar(默认共享 jar)
 ---@return table[]
-function M.load_cookies()
-  M.ensure_jar()
-  return cookies.load(M.jar_path())
+function M.load_cookies(path)
+  path = path or M.jar_path()
+  M.ensure_jar(path)
+  return cookies.load(path)
 end
 
 ---Replace the whole jar. Used by the login flow, which swaps accounts and must
@@ -180,16 +185,18 @@ end
 ---(整体替换 jar；登录流程会切换账号，不能继承上一个账号的 cookie。返回写入结果，
 --- 调用方才能让登录失败，而不是带着过期的 jar 继续)
 ---@param list table[]
+---@param path string|nil defaults to the shared jar(默认共享 jar)
 ---@return boolean|nil ok
 ---@return string|nil err
-function M.set_cookies(list)
-  return cookies.save(M.jar_path(), list)
+function M.set_cookies(list, path)
+  return cookies.save(path or M.jar_path(), list)
 end
 
+---@param path string|nil defaults to the shared jar(默认共享 jar)
 ---@return boolean|nil ok
 ---@return string|nil err
-function M.clear_cookies()
-  return M.set_cookies({})
+function M.clear_cookies(path)
+  return M.set_cookies({}, path)
 end
 
 ---@return string
@@ -214,7 +221,9 @@ end
 --- 共享 jar 里其余的内容都比这个请求看到的更新，原样保留)
 ---@param before table[] the jar when the request started(请求开始时的 jar)
 ---@param out_path string the jar curl wrote for this request(curl 为这次请求写出的 jar)
-merge_jar = function(before, out_path)
+---@param target string|nil jar to merge into, defaults to the shared jar(合并目标 jar，默认共享 jar)
+merge_jar = function(before, out_path, target)
+  target = target or M.jar_path()
   local file = io.open(out_path, "rb")
   if not file then
     return
@@ -230,7 +239,7 @@ merge_jar = function(before, out_path)
     new[cookie_key(cookie)] = cookie
   end
   local changed = false
-  local jar = cookies.load(M.jar_path())
+  local jar = cookies.load(target)
   for key, cookie in pairs(new) do
     if old[key] ~= cookie.value then
       cookies.upsert(jar, cookie)
@@ -250,7 +259,7 @@ merge_jar = function(before, out_path)
     end
   end
   if changed then
-    local ok, err = cookies.save(M.jar_path(), jar)
+    local ok, err = cookies.save(target, jar)
     if not ok then
       warn_line("could not merge cookies into the jar: " .. tostring(err))
     end
@@ -385,18 +394,20 @@ local function build_argv(opts, body_path)
     argv[#argv + 1] = "--header"
     argv[#argv + 1] = "Cookie: "
   else
-    M.ensure_jar()
+    local jar = opts.cookie_jar or M.jar_path()
+    M.ensure_jar(jar)
     argv[#argv + 1] = "--cookie"
-    argv[#argv + 1] = M.jar_path()
+    argv[#argv + 1] = jar
     if opts.persist then
       -- curl rewrites the whole jar it read at start, so two requests writing
-      -- the shared jar lose each other's cookies (a renewal undone by a page
+      -- the same jar lose each other's cookies (a renewal undone by a page
       -- fetch that started before it). Each one writes a private jar, and only
       -- what its response changed is merged back.
-      -- (curl 会把启动时读到的整份 jar 重写回去，两个请求同写共享 jar 会互相丢掉对方的 cookie
+      -- (curl 会把启动时读到的整份 jar 重写回去，两个请求同写同一个 jar 会互相丢掉对方的 cookie
       --  （比如一次续期被它之前发出的页面请求覆盖）。每个请求写自己的 jar，只把它的响应改动的部分合并回去)
-      opts._jar_before = cookies.load(M.jar_path())
+      opts._jar_before = cookies.load(jar)
       opts._jar_out = next_tmp("jar")
+      opts._jar_target = jar
       argv[#argv + 1] = "--cookie-jar"
       argv[#argv + 1] = opts._jar_out
     end
@@ -598,8 +609,8 @@ local function attempt(opts, handle, callback)
     --  因此先切回主循环再交付响应)
     vim.schedule(function()
       if opts._jar_out then
-        merge_jar(opts._jar_before, opts._jar_out)
-        opts._jar_before, opts._jar_out = nil, nil
+        merge_jar(opts._jar_before, opts._jar_out, opts._jar_target)
+        opts._jar_before, opts._jar_out, opts._jar_target = nil, nil, nil
       end
       callback(res)
     end)

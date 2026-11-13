@@ -91,20 +91,29 @@ local fake_http = {
 }
 
 function fake_http.setup() end
-function fake_http.load_cookies()
+-- `path` selects the private login jar; without it this is the shared jar.
+-- (path 选择私有的登录 jar；不传就是共享 jar)
+function fake_http.load_cookies(path)
+  if path then
+    return vim.deepcopy(fake_http.login_jar)
+  end
   return vim.deepcopy(fake_http.jar)
 end
 -- `jar_error` makes the next jar writes fail the way the real layer reports it.
 -- (jar_error 让之后的 jar 写入按真实层的方式失败)
-function fake_http.set_cookies(list)
+function fake_http.set_cookies(list, path)
   if fake_http.jar_error then
     return nil, fake_http.jar_error
   end
-  fake_http.jar = vim.deepcopy(list)
+  if path then
+    fake_http.login_jar = vim.deepcopy(list)
+  else
+    fake_http.jar = vim.deepcopy(list)
+  end
   return true
 end
-function fake_http.clear_cookies()
-  return fake_http.set_cookies({})
+function fake_http.clear_cookies(path)
+  return fake_http.set_cookies({}, path)
 end
 function fake_http.decode_json(res)
   if not res or res.code == 0 or not res.body or res.body == "" then
@@ -204,6 +213,7 @@ local function reset()
   fake_http.requests = {}
   fake_http.handles = {}
   fake_http.jar = {}
+  fake_http.login_jar = {}
   fake_http.jar_error = nil
   fake_qr.shown = {}
   scripted_input = { "1234" }
@@ -352,7 +362,111 @@ describe("auth.login", function()
     truthy(auth.is_logged_in(), "second attempt succeeded")
   end)
 
-  it("reports an account without the WeRead skill enabled", function()
+  it("keeps polling with the OTP after a delayed verification", function()
+    reset()
+    scripted_input = { "4321" }
+    fake_http.expect("/r/weread-skills", { { body = "ok" } })
+    fake_http.expect("/api/auth/getLoginUid", { { body = { uid = "uid-otp-late" } } })
+    fake_http.expect("/api/auth/getLoginInfo", {
+      { body = { logicCode = "NEED_OTP" } },
+      -- the server has not finished verifying yet (服务端还没验完)
+      "pending",
+      { body = LOGIN_OK },
+    })
+    fake_http.expect("/api/userInfo", { { body = { name = "late-otp" } } })
+    fake_http.expect("/api/skills/apikeyGet", { { body = { apikey = "wrk-late" } } })
+
+    auth.login()
+    drain()
+
+    local with_otp = 0
+    for _, request in ipairs(fake_http.requests) do
+      if request.url:find("getLoginInfo", 1, true) and request.url:find("otp=4321", 1, true) then
+        with_otp = with_otp + 1
+      end
+    end
+    eq(with_otp, 2, "the retried poll still carried the code")
+    truthy(auth.is_logged_in())
+  end)
+
+  it("recognises a numeric succeed flag", function()
+    reset()
+    fake_http.expect("/r/weread-skills", { { body = "ok" } })
+    fake_http.expect("/api/auth/getLoginUid", { { body = { uid = "uid-num" } } })
+    fake_http.expect("/api/auth/getLoginInfo", {
+      {
+        body = {
+          succeed = 1,
+          webLoginVid = "vid-num",
+          accessToken = "skey-num",
+          refreshToken = "refresh-num",
+        },
+      },
+    })
+    fake_http.expect("/api/userInfo", { { body = { name = "numeric" } } })
+    fake_http.expect("/api/skills/apikeyGet", { { body = { apikey = "wrk-num" } } })
+
+    auth.login()
+    drain()
+
+    truthy(auth.is_logged_in())
+    eq(auth.account_name(), "numeric")
+  end)
+
+  it("turns a rejected login session into an expired QR instead of spinning", function()
+    reset()
+    fake_http.expect("/r/weread-skills", { { body = "ok" } })
+    fake_http.expect("/api/auth/getLoginUid", { { body = { uid = "uid-revoked" } } })
+    fake_http.expect("/api/auth/getLoginInfo", {
+      {
+        status = 401,
+        body = {
+          statusCode = 401,
+          message = "Cgi Request Error",
+          data = { errcode = -2013, errmsg = "鉴权失败" },
+        },
+      },
+    })
+
+    auth.login()
+    drain()
+
+    truthy(notified("二维码已过期"), "the dead session is surfaced")
+    matches(fake_qr.shown[1].footers[#fake_qr.shown[1].footers], "二维码已过期")
+    eq(credentials(), nil)
+  end)
+
+  it("runs the handshake in a private jar instead of the logged-in account", function()
+    reset()
+    fake_http.jar = {
+      { name = "wr_vid", value = "old-vid", domain = ".weread.qq.com", path = "/", expires = 0 },
+    }
+    fake_http.expect("/r/weread-skills", { { body = "ok" } })
+    fake_http.expect("/api/auth/getLoginUid", { { body = { uid = "uid-jar-iso" } } })
+    fake_http.expect("/api/auth/getLoginInfo", { { body = LOGIN_OK } })
+    fake_http.expect("/api/userInfo", { { body = { name = "iso" } } })
+    fake_http.expect("/api/skills/apikeyGet", { { body = { apikey = "wrk-iso" } } })
+
+    auth.login()
+    drain()
+
+    local handshake = 0
+    for _, request in ipairs(fake_http.requests) do
+      if
+        request.url:find("/r/weread-skills", 1, true)
+        or request.url:find("/api/auth/getLoginUid", 1, true)
+        or request.url:find("/api/auth/getLoginInfo", 1, true)
+      then
+        handshake = handshake + 1
+        eq(request.cookie_jar, auth.login_jar_path(), request.url)
+      end
+    end
+    truthy(handshake >= 3, "all handshake requests were seen")
+    truthy(auth.is_logged_in())
+    eq(credentials().cookies.wr_vid, "vid-0001", "the confirmed account replaced the old one")
+  end)
+
+  it("keeps a successful login even when the WeRead skill is not enabled", function()
     reset()
     fake_http.expect("/r/weread-skills", { { body = "ok" } })
     fake_http.expect("/api/auth/getLoginUid", { { body = { uid = "uid-4" } } })
@@ -363,9 +477,12 @@ describe("auth.login", function()
     auth.login()
     drain()
 
-    truthy(notified("微信读书 Skill"), "explains how to enable the skill")
-    eq(credentials(), nil, "nothing persisted without an API key")
-    falsy(auth.is_logged_in())
+    truthy(notified("未获取到官方 API Key"), "explains that the shelf needs the skill")
+    truthy(notified("微信读书 Skill"), "and how to enable it")
+    truthy(auth.is_logged_in(), "the cookie-authenticated reader is logged in")
+    eq(auth.api_key(), nil)
+    eq(credentials().account.name, "no-skill")
+    truthy(jar_cookie("wr_vid"), "the new account's cookies are in the jar")
   end)
 
   it("expires the QR code after the session budget", function()
@@ -376,7 +493,10 @@ describe("auth.login", function()
 
     local session = auth.login()
     local before = #fake_http.requests
-    session.started = os.time() - 4000
+    -- The deadline is monotonic; pushing it into the past simulates a budget
+    -- that ran out without depending on the wall clock.
+    -- (截止时间用单调时钟；把它推到过去即可模拟预算耗尽，不依赖系统时钟)
+    session.deadline = vim.uv.hrtime() - 1
     drain()
 
     truthy(notified("二维码已过期"))
@@ -399,6 +519,24 @@ describe("auth.login", function()
     eq(#fake_http.requests, before, "no further requests after cancel")
     eq(credentials(), nil)
     falsy(auth.is_logged_in())
+  end)
+
+  it("clears the old account first when the command has a bang", function()
+    reset()
+    auth.save_credentials({
+      version = 1,
+      api_key = "old-key",
+      cookies = { wr_vid = "old", wr_skey = "old", wr_ql = "0", wr_rt = "old" },
+    })
+    fake_http.expect("/r/weread-skills", { { body = "ok" } })
+    fake_http.expect("/api/auth/getLoginUid", { { body = { uid = "uid-force" } } })
+
+    auth.login({ force = true })
+
+    falsy(auth.is_logged_in(), "the old credentials are gone before the handshake")
+    eq(#jar(), 0, "and so are the old cookies")
+    eq(fake_qr.shown[1].title, "微信读书 · 请用微信扫码", "no switch-account hint")
+    auth.cancel()
   end)
 
   it("fails cleanly when the login page is unreachable", function()
@@ -576,9 +714,12 @@ describe("auth login when the cookie jar cannot be written", function()
     fake_http.expect("/r/weread-skills", { { body = "ok" } })
     fake_http.expect("/api/auth/getLoginUid", { { body = { uid = "uid-jar" } } })
     fake_http.expect("/api/auth/getLoginInfo", { { body = LOGIN_OK } })
-    fake_http.jar_error = "disk full"
 
     auth.login()
+    -- The private login jar was created already; make the next write (writing
+    -- the confirmed credentials into it) fail.
+    -- (私有登录 jar 已经创建；让下一次写入——把确认后的凭据写进去——失败)
+    fake_http.jar_error = "disk full"
     drain()
 
     truthy(notified("登录凭据写入失败"), "the failure is reported")
@@ -595,13 +736,13 @@ describe("auth login when the cookie jar cannot be written", function()
     fake_http.expect("/r/weread-skills", { { body = "ok" } })
     fake_http.expect("/api/auth/getLoginUid", { { body = { uid = "uid-jar2" } } })
     fake_http.expect("/api/auth/getLoginInfo", { { body = LOGIN_OK } })
+    auth.login()
     local original = fake_http.set_cookies
     fake_http.set_cookies = function()
       error("boom")
     end
 
     local ok = pcall(function()
-      auth.login()
       drain()
     end)
     fake_http.set_cookies = original

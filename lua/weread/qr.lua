@@ -293,29 +293,48 @@ function M.show(text, opts)
     end
     height = math.max(3, math.min(height, screen_height))
 
+    -- The image is an extmark-driven placement, not text in the buffer.
+    -- Closing the window alone can leave it rendered until the next redraw, so
+    -- keep the placement and close it explicitly too.
+    -- (图片是由 extmark 驱动的 placement，不是 buffer 文本。只关窗口可能在下次重绘前
+    --  一直留着它，因此同时保存 placement 并显式关闭)
+    local placement = nil
+    local function cleanup()
+      if placement and type(placement.close) == "function" then
+        pcall(placement.close, placement)
+      end
+      placement = nil
+    end
+
     local win = float.open({
       title = title,
       width = width,
       height = height,
       footer = opts.footer,
       filetype = "image",
-      on_close = opts.on_close,
+      on_close = function()
+        cleanup()
+        if opts.on_close then
+          opts.on_close()
+        end
+      end,
       keymaps = false,
     })
     if win then
       map_keys(win, opts)
       vim.api.nvim_buf_set_name(win:get_buf(), png)
       local ok, err = pcall(function()
-        require("snacks.image.buf").attach(win:get_buf(), {
+        placement = require("snacks.image.buf").attach(win:get_buf(), {
           src = png,
           max_width = width,
           max_height = height,
         })
       end)
       if ok then
-        return { float = win, png = png, mode = "image" }, nil
+        return { float = win, png = png, mode = "image", placement = placement, cleanup = cleanup }, nil
       end
       log.warn("snacks.image attach failed: %s", tostring(err))
+      cleanup()
       win:close()
     end
   end

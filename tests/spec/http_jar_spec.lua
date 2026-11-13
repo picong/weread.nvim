@@ -26,6 +26,12 @@ local server = mock_lib.start({
       return { status = 200, ctype = "text/plain", body = "ok", headers = { "Set-Cookie: wr_skey=new; Path=/" } }
     end,
   },
+  {
+    path = "/setlogin",
+    handler = function()
+      return { status = 200, ctype = "text/plain", body = "ok", headers = { "Set-Cookie: login=1; Path=/" } }
+    end,
+  },
 })
 
 local config = require("weread.config")
@@ -62,6 +68,28 @@ describe("http jar under concurrent requests", function()
     eq(finished, { "renew", "page" }, "the renewal finished first")
     eq(jar_value("wr_skey"), "new", "the renewed token survives whichever finished last")
     eq(jar_value("page"), "1", "and the page's own cookie was merged in too")
+  end)
+
+  it("keeps a private login jar separate from the shared jar", function()
+    local login_jar = config.path("login-cookies.txt")
+    -- the shared jar belongs to the account that is still logged in
+    -- (共享 jar 属于仍在登录的那个账号)
+    http.set_cookies({ { name = "wr_vid", value = "old", domain = "127.0.0.1", path = "/", expires = 0 } })
+    vim.uv.fs_unlink(login_jar)
+    http.clear_cookies(login_jar)
+
+    local finished = false
+    http.request({ url = server.url .. "/setlogin", persist = true, retries = 0, cookie_jar = login_jar }, function()
+      finished = true
+    end)
+    vim.wait(5000, function()
+      return finished
+    end, 20)
+
+    local private = cookies.load(login_jar)
+    eq(cookies.get(private, "login").value, "1", "the private jar received the response cookie")
+    eq(cookies.get(http.load_cookies(), "login"), nil, "the shared jar stayed untouched")
+    eq(jar_value("wr_vid"), "old", "and kept its own account")
   end)
 
   it("leaves no private jar behind", function()

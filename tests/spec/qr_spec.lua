@@ -118,9 +118,15 @@ describe("qr.show", function()
     end
 
     local attached = {}
+    local placement_closed = false
     package.loaded["snacks.image.buf"] = {
       attach = function(buf, opts)
         attached[#attached + 1] = { buf = buf, opts = opts }
+        return {
+          close = function()
+            placement_closed = true
+          end,
+        }
       end,
     }
 
@@ -139,6 +145,9 @@ describe("qr.show", function()
     truthy(dialog.float.width <= vim.o.columns - 6, "width fits")
     truthy(dialog.float.height <= vim.o.lines - 6, "height fits")
     truthy(dialog.float.height >= 3, "height is usable")
+
+    dialog.cleanup()
+    truthy(placement_closed, "closing the dialog also removes the image placement")
 
     close(dialog)
     image.supports_inline = real_supports
