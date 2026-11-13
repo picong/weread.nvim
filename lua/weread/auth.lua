@@ -631,7 +631,7 @@ local function ask_otp(session, message)
     vim.log.levels.WARN
   )
   local called, err = pcall(vim.ui.input, { prompt = "微信读书 4 位验证码: " }, function(input)
-    if not is_current(session) then
+    if not is_current(session) or session.expired then
       return
     end
     local otp = vim.trim(input or "")
@@ -702,7 +702,7 @@ end
 ---@param session table
 ---@param otp string|nil
 function M._poll(session, otp)
-  if not is_current(session) or session.expired then
+  if not is_current(session) or session.expired or not session.uid then
     return
   end
   if otp ~= nil then
