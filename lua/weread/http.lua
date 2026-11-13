@@ -231,6 +231,12 @@ merge_jar = function(before, out_path, target)
   local after = cookies.parse(file:read("*a") or "")
   file:close()
   os.remove(out_path)
+  -- The target may have been deleted while this request was in flight (the
+  -- login jar is removed on cancel); do not recreate it just to merge.
+  -- (请求在途时目标可能已被删除（取消登录会删私有 jar）；不要为了合并又把它建出来)
+  if not vim.uv.fs_stat(target) then
+    return
+  end
   local old, new = {}, {}
   for _, cookie in ipairs(before or {}) do
     old[cookie_key(cookie)] = cookie.value
